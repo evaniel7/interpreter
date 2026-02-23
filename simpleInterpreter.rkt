@@ -2,251 +2,154 @@
 
 (require "simpleParser.rkt")
 
-; (file-exists? "test.txt")
+; Checks if a list item is an atom (i.e. a non-null, non-list object)
+(define (atom? x)
+  (and (not (null? x))
+       (not (pair? x))))
 
+; Interprets the code contained in the file with the inputted filename
+(define interpret
+  (lambda (filename) (interpret-raw-code (parser filename) '())))
+
+; Replaces "#t" with "true" and "#f" with "false", but leaves the inputted value untouched otherwise
+(define translate-booleans
+  (lambda (output)
+    (if (boolean? output) (if (eq? output #t) 'true 'false) output)))
+
+; Interprets the inputted pre-parsed code one statement at a time, or returns the value of the current statement if it is a "return" statement 
 (define interpret-raw-code
-  (lambda (code)
+  (lambda (code variables)
     (cond
-      ((null? code) (newline))
-      ((list? (car code)) (car code))
+      ((null? code) variables)
+      ((return? (car code)) (translate-booleans (return-value (interpret-statement (car code) variables) variables)))
+      ((list? (car code)) (interpret-raw-code (cdr code) (interpret-statement (car code) variables)))
       (else code))))
 
+; Shortcuts for checking if a statement declares a variable, assigns a value to one, or returns a value
+(define (declaration? statement) (eq? 'var (car statement)))
+(define (assignment? statement) (eq? '= (car statement)))
+(define (return? statement) (eq? 'return (car statement)))
+
+(define (math? statement) (set-member? (set '+ '- '* '/ '%) (car statement))) ; Checks if the statement is just simple arithemetic 
+; Performs an arithemetic operation on the inputted integer(s) using the inputted operator
+(define (do-math operator arg1 arg2)
+  (cond
+    ((or (null? arg1) (and (not (eq? operator '-)) (null? arg2))) (error "Too many null arguments. Ensure that values have been assigned to variables before using them!"))
+    ((eq? operator '+) (+ arg1 arg2))
+    ((eq? operator '-) (if (null? arg2) (* arg1 -1) (- arg1 arg2))) ; The "if" statement allows for instant negation of a single value
+    ((eq? operator '*) (* arg1 arg2))
+    ((eq? operator '/) (quotient arg1 arg2))
+    ((eq? operator '%) (remainder arg1 arg2))
+    (else null)))
+
+(define (boolean-expression? statement) (set-member? (set '&& '|| '!) (car statement))) ; Checks if the statement is a simple boolean expression
+; Evaluates the boolean expression formed by the boolean input(s) and the inputted connective
+(define (boolean connective arg1 arg2)
+  (cond
+    ((eq? connective '&&) (and arg1 arg2))
+    ((eq? connective '||) (or arg1 arg2))
+    ((eq? connective '!) (not arg1)) ; Logical "not" only needs the first argument, so the second one is ignored if it exists
+    (else #f)))
+
+(define (comparison? statement) (set-member? (set '== '!= '< '<= '> '>=) (car statement))) ; Checks if the statement is comparing two values
+; Performs a comparison between two values using the inputted comparator
+(define (compare comparator arg1 arg2)
+  (cond
+    ((eq? comparator '==) (eq? arg1 arg2))
+    ((eq? comparator '!=) (not (eq? arg1 arg2)))
+    ((eq? comparator '<) (< arg1 arg2))
+    ((eq? comparator '<=) (<= arg1 arg2))
+    ((eq? comparator '>) (> arg1 arg2))
+    ((eq? comparator '>=) (>= arg1 arg2))
+    (else #f)))
+
+; Interprets simple statements (i.e. expressions) and returns their results
+(define return-value
+  (lambda (output variables)
+    (cond
+      ((null? output) null)
+      ((number? output) output)
+      ((eq? 'true output) #t)
+      ((eq? 'false output) #f)
+      ((atom? output) (get-variable output variables))
+      ((math? output) (do-math (car output) (return-value (arg1 output) variables) (return-value (arg2 output) variables)))
+      ((comparison? output) (compare (car output) (return-value (arg1 output) variables) (return-value (arg2 output) variables)))
+      ((boolean-expression? output) (boolean (car output) (return-value (arg1 output) variables) (return-value (arg2 output) variables)))
+      (else (return-value (car output) variables)))))
+
+; Shortcuts to get the 1st, 2nd, and 3rd arguments of a statement, whenever they exist
+(define (arg1 statement) (car (cdr statement))) 
+(define (arg2 statement) (if (empty? (cdr (cdr statement))) null (car (cdr (cdr statement)))))
+(define (arg3 statement) (arg2 (cdr statement)))
+
+(define (if-statement? statement) (eq? 'if (car statement))) ;Checks if the inputted statement is an "if" statement
+; Executes the inputted "if" statement and updates the program's variables accordingly
+(define if-statement
+  (lambda (condition if-true else variables)
+    (if (not (list? condition))
+        (error "Conditions in if statements must be enclosed in parentheses!")
+        (if (return-value condition variables) (interpret-statement if-true variables) (interpret-statement else variables)))))
+
+(define (while-statement? statement) (eq? 'while (car statement))) ; Checks if the inputted statement is a "while" statement
+; Executes the inputted "while" statement and updates the program's variables accordingly
+(define while-statement-with-break
+  (lambda (condition body variables break)
+    (if (not (list? condition))
+        (error "Conditions in while statements must be enclosed in parentheses!")
+        (if (return-value condition variables)
+            (while-statement-with-break condition body (interpret-statement body variables) break)
+            (break variables)))))
+
+(define while-statement (lambda (condition body variables) (while-statement-with-break condition body variables (lambda (v) v))))
+
+; Updates the program's variables by executing the inputted statement, or returning its associated value if it is a "return" statement
+(define interpret-statement
+  (lambda (statement variables)
+    (cond
+      ((null? statement) variables)
+      ((declaration? statement) (add-variable (arg1 statement) (return-value (arg2 statement) variables) variables))
+      ((assignment? statement) (set-variable (arg1 statement) (return-value (arg2 statement) variables) variables))
+      ((if-statement? statement) (if-statement (arg1 statement) (arg2 statement) (arg3 statement) variables))
+      ((while-statement? statement) (while-statement (arg1 statement) (arg2 statement) variables))
+      ((return? statement) (return-value (cdr statement) variables))
+      (else (error "Statement could not be parsed!")))))
+
+; Takes a name and a value and creates a binding between them
 (define new-variable
   (lambda (var-name value) (list (cons var-name value))))
 
+(define (var-exists? var-name variables) (if (assoc var-name variables) #t #f)) ; Checks if a given variable exists
+
+; Adds a new variable with the inputted name and value if it doesn't already exist
 (define add-variable
   (lambda (var-name value variables)
     (cond
       ((empty? variables) (new-variable var-name value))
+      ((var-exists? var-name variables) (error "The variable you are trying to declare already exists!"))
       ((and (pair? variables) (null? (cdr variables))) (cons (car variables) (new-variable var-name value)))
       (else (append variables (new-variable var-name value))))))
 
-(define (value binding) (cdr binding))
-(define (name binding) (car binding))
+(define (value binding) (cdr binding)) ; Gets the "value" part of a name-value binding
+(define (name binding) (car binding)) ; Gets the "name" part of a name-value binding
 
-; need to add helper function with break functionality for this one
-(define set-variable
-  (lambda (var-name value variables)
+; Gets the value bound to a variable with the inputted name, if it exists
+(define get-variable-cps
+  (lambda (var-name variables return)
+    (cond
+      ((empty? variables) (error "The variable does not exist! Make sure it has been declared first!"))
+      ((eq? (name (car variables)) var-name) (return (value (car variables))))
+      (else (get-variable-cps var-name (cdr variables) return)))))
+
+(define get-variable
+  (lambda (var-name variables) (get-variable-cps var-name variables (lambda (v) v))))
+
+; Takes the name of an existing variable and its new value and creates a new binding between them to replace the current one
+(define set-variable-cps
+  (lambda (var-name val variables return)
     (cond
       ((empty? variables) (error "Variables must be declared before they can be assigned values!"))
-      ((eq? (name (car variables)) var-name) (add-variable var-name value (cdr variables)))
-      (else (append (car variables) (set-variable var-name value (cdr (list variables))))))))
+      ((eq? (name (car variables)) var-name) (return (add-variable var-name val (cdr variables))))
+      (else (set-variable-cps var-name val (cdr variables) (lambda (k) (return (cons (car variables) k))))))))
 
-
-; -------------------------
-; STATE (alist of (name . value))
-; use 'unassigned for declared-but-not-set
-; -------------------------
-
-(define empty-state
-  (lambda () '()))
-
-(define binding-name car)
-(define binding-value cdr)
-
-(define declared?
-  (lambda (var state)
-    (cond
-      ((null? state) #f)
-      ((eq? (binding-name (car state)) var) #t)
-      (else (declared? var (cdr state))))))
-
-(define state-declare
-  (lambda (var val state)
-    (cond
-      ((declared? var state) (error "Variable already declared:" var))
-      (else (cons (cons var val) state)))))
-
-(define state-lookup
-  (lambda (var state)
-    (cond
-      ((null? state) (error "Variable used before declaring:" var))
-      ((eq? (binding-name (car state)) var)
-       (let ((v (binding-value (car state))))
-         (if (eq? v 'unassigned)
-             (error "Variable used before assigning:" var)
-             v)))
-      (else (state-lookup var (cdr state))))))
-
-(define state-update
-  (lambda (var val state)
-    (cond
-      ((null? state) (error "Variable must be declared before assignment:" var))
-      ((eq? (binding-name (car state)) var)
-       (cons (cons var val) (cdr state)))
-      (else (cons (car state) (state-update var val (cdr state)))))))
-
-; -------------------------
-; M_value / M_integer (expressions -> value)
-; (for now: integers + variable references only)
-; -------------------------
-
-(define operator car)
-(define operand1 cadr)
-(define operand2 caddr)
-
-(define M_integer
-  (lambda (expression state)
-    (cond
-      ((number? expression) expression)
-      ((symbol? expression) (state-lookup expression state))  ; variable reference
-
-      ;; unary minus: (- x)
-      ((and (pair? expression)
-            (eq? (operator expression) '-)
-            (= (length expression) 2))
-       (- (M_integer (operand1 expression) state)))
-
-      ;; binary ops: (+ a b), (- a b), (* a b), (/ a b), (% a b)
-      ((and (pair? expression) (symbol? (operator expression)))
-       (cond
-         ((eq? '+ (operator expression))
-          (+ (M_integer (operand1 expression) state)
-             (M_integer (operand2 expression) state)))
-
-         ((eq? '- (operator expression))
-          (- (M_integer (operand1 expression) state)
-             (M_integer (operand2 expression) state)))
-
-         ((eq? '* (operator expression))
-          (* (M_integer (operand1 expression) state)
-             (M_integer (operand2 expression) state)))
-
-         ((eq? '/ (operator expression))
-          (quotient (M_integer (operand1 expression) state)
-                    (M_integer (operand2 expression) state)))
-
-         ((eq? '% (operator expression))
-          (remainder (M_integer (operand1 expression) state)
-                     (M_integer (operand2 expression) state)))
-
-         (else (error "Invalid operator:" (operator expression)))))
-
-      (else (error "Bad integer expression:" expression)))))
-
-(define M_value
-  (lambda (expr state)
-    (cond
-      ;; boolean literals
-      ((or (eq? expr 'true) (eq? expr 'false))
-       expr)
-
-      ;; boolean operator forms
-      ((and (pair? expr) (member (car expr) '(|| && ! < <= > >= == !=)))
-       (M_boolean expr state))
-
-      ;; otherwise treat as integer expression / variable / number
-      (else
-       (M_integer expr state)))))
-
-; -------------------------
-; M_boolean 
-; -------------------------
-
-(define (bool->lang b) (if b 'true 'false))
-
-(define (lang-bool? v) (or (eq? v 'true) (eq? v 'false)))
-
-(define (lang->bool v)
-  (cond ((eq? v 'true) #t)
-        ((eq? v 'false) #f)
-        (else (error "Expected boolean, got:" v))))
-
-(define M_boolean
-  (lambda (c state)
-    (cond
-      ((eq? c 'true) 'true)
-      ((eq? c 'false) 'false)
-      ((symbol? c) (let ((v (state-lookup c state)))
-                     (if (lang-bool? v) v (error "Expected boolean var:" c))))
-
-      ;; (! cond)
-      ((and (pair? c) (eq? (car c) '!))
-       (bool->lang (not (lang->bool (M_boolean (cadr c) state)))))
-
-      ;; (&& c1 c2), (|| c1 c2)
-      ((and (pair? c) (eq? (car c) '&&))
-       (bool->lang (and (lang->bool (M_boolean (cadr c) state))
-                        (lang->bool (M_boolean (caddr c) state)))))
-      ((and (pair? c) (eq? (car c) '||))
-       (bool->lang (or (lang->bool (M_boolean (cadr c) state))
-                       (lang->bool (M_boolean (caddr c) state)))))
-
-      ;; comparisons: (< a b) etc. where a/b are int expressions
-      ((and (pair? c) (member (car c) '(< <= > >= == !=)))
-       (let ((a (M_integer (cadr c) state))
-             (b (M_integer (caddr c) state))
-             (op (car c)))
-         (bool->lang
-          (cond ((eq? op '<)  (< a b))
-                ((eq? op '<=) (<= a b))
-                ((eq? op '>)  (> a b))
-                ((eq? op '>=) (>= a b))
-                ((eq? op '==) (= a b))
-                ((eq? op '!=) (not (= a b)))
-                (else (error "bad compare"))))))
-      (else (error "Bad condition:" c)))))
-
-; -------------------------
-; M_state (statements -> new state)
-; statement list evaluation stops early if 'return is set
-; -------------------------
-
-(define returned?
-  (lambda (state)
-    (and (declared? 'return state)
-         (not (eq? (state-lookup 'return state) 'unassigned)))))
-
-(define M_state-stmt
-  (lambda (stmt state)
-    (cond
-      ((and (pair? stmt) (eq? (car stmt) 'var))
-        (let ((x (cadr stmt)))
-          (if (= (length stmt) 2)
-            (state-declare x 'unassigned state)
-            (state-declare x (M_value (caddr stmt) state) state))))
-
-      ;; (= x expr)
-      ((and (pair? stmt) (eq? (car stmt) '=))
-       (let ((x (cadr stmt))
-             (e (caddr stmt)))
-         (state-update x (M_value e state) state)))
-
-      ;; (return expr)  -> store into special 'return variable
-      ((and (pair? stmt) (eq? (car stmt) 'return))
-       (let ((v (M_value (cadr stmt) state)))
-         (if (declared? 'return state)
-             (state-update 'return v state)
-             (state-declare 'return v state))))
-
-      ((and (pair? stmt) (eq? (car stmt) 'if))
-        (let* ((cond-expr (cadr stmt))
-            (then-stmt (caddr stmt))
-            (else-stmt (if (= (length stmt) 4) (cadddr stmt) #f))
-            (cond-val (lang->bool (M_boolean cond-expr state))))
-          (if cond-val
-            (M_state-stmt then-stmt state)
-              (if else-stmt (M_state-stmt else-stmt state) state))))
-
-      (else (error "Unknown statement:" stmt)))))
-
-(define M_state-stmtlist
-  (lambda (stmts state)
-    (cond
-      ((null? stmts) state)
-      ((returned? state) state) ; stop executing after return
-      (else (M_state-stmtlist (cdr stmts) (M_state-stmt (car stmts) state))))))
-
-
-; -------------------------
-; interpret
-; -------------------------
-
-(define interpret
-  (lambda (filename)
-    (let* ((tree (parser filename))
-           (final (M_state-stmtlist tree (empty-state))))
-      (state-lookup 'return final))))
-
-(displayln (interpret "test15.txt"))
-      
+(define set-variable
+  (lambda (var-name val variables) (set-variable-cps var-name val variables (lambda (v) v))))
