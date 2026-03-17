@@ -69,6 +69,7 @@
     (cond
       ((null? output) null)
       ((number? output) output)
+      ((boolean? output) output)
       ((eq? 'true output) #t)
       ((eq? 'false output) #f)
       ((atom? output) (get-variable output variables))
@@ -116,7 +117,7 @@
 
 ; Takes a name and a value and creates a binding between them
 (define new-variable
-  (lambda (var-name value) (list (cons var-name value))))
+  (lambda (var-name value) (cons var-name value)))
 
 (define (var-exists? var-name variables) (if (assoc var-name variables) #t #f)) ; Checks if a given variable exists
 
@@ -124,10 +125,9 @@
 (define add-variable
   (lambda (var-name value variables)
     (cond
-      ((empty? variables) (new-variable var-name value))
+      ((empty? variables) (list (new-variable var-name value)))
       ((var-exists? var-name variables) (error "The variable you are trying to declare already exists!"))
-      ((and (pair? variables) (null? (cdr variables))) (cons (car variables) (new-variable var-name value)))
-      (else (append variables (new-variable var-name value))))))
+      (else (cons (new-variable var-name value) variables)))))
 
 (define (value binding) (cdr binding)) ; Gets the "value" part of a name-value binding
 (define (name binding) (car binding)) ; Gets the "name" part of a name-value binding
