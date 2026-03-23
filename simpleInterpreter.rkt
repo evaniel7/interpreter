@@ -55,14 +55,14 @@
       ((null? statement) (next layers))
       ((block? statement) (execute-block (cdr statement) (new-layer layers) next return continue break throw))
       ((try? statement) (try-catch-block (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
-      ((throw? statement) (return-value* (cdr statement) layers (lambda (k) (throw k layers))))
+      ((throw? statement) (return-value* (cdr statement) layers (lambda (k s) (throw k s))))
       ((continue? statement) (continue layers))
       ((break? statement) (break layers))
-      ((declaration? statement) (return-value* (arg2 statement) layers (lambda (k) (add-variable* (arg1 statement) k layers next))))
-      ((assignment? statement) (return-value* (arg2 statement) layers (lambda (k) (set-variable* (arg1 statement) k layers next))))
+      ((declaration? statement) (return-value* (arg2 statement) layers (lambda (k s) (add-variable* (arg1 statement) k s next))))
+      ((assignment? statement) (return-value* (arg2 statement) layers (lambda (k s) (set-variable* (arg1 statement) k s next))))
       ((if-statement? statement) (if-statement* (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
       ((while-statement? statement) (while-statement* (arg1 statement) (arg2 statement) layers next return continue break throw))
-      ((return? statement) (return-value* (cdr statement) layers (lambda (k) (return k layers))))
+      ((return? statement) (return-value* (cdr statement) layers (lambda (k s) (return k s))))
       (else (error "The following statement count not be parsed: " statement)))))
 
 ; Handles execution of code blocks, automatically removing the block's variable layer once execution is finished
@@ -118,38 +118,39 @@
 (define if-statement*
   (lambda (condition if-true else layers next return continue break throw)
     (return-value* condition layers
-      (lambda (condition-result) (if condition-result
-        (interpret-statement* if-true layers next return continue break throw)
-        (interpret-statement* else layers next return continue break throw))))))
+      (lambda (condition-result side-effect) (if condition-result
+        (interpret-statement* if-true side-effect next return continue break throw)
+        (interpret-statement* else side-effect next return continue break throw))))))
 
 ; Executes the inputted "while" statement and updates the program's variable layers accordingly
 (define while-statement*
   (lambda (condition body layers next return continue break throw)
     (return-value* condition layers
-      (lambda (condition-result) (if condition-result
+      (lambda (condition-result side-effect) (if condition-result
         (interpret-statement*
           body
-          layers
+          side-effect
           (lambda (new-layers) (while-statement* condition body new-layers next return continue break throw))
           return
           (lambda (new-layers) (while-statement* condition body new-layers next return continue break throw))
           next
           throw)
-        (next layers))))))
+        (next side-effect))))))
 
 ; Interprets simple statements (i.e. expressions) and returns their results
 (define return-value*
   (lambda (output layers cc)
     (cond
-      ((null? output) (cc null))
-      ((number? output) (cc output))
-      ((boolean? output) (cc output))
-      ((eq? 'true output) (cc #t))
-      ((eq? 'false output) (cc #f))
-      ((atom? output) (cc (get-variable* output layers)))
-      ((math? output) (return-value* (arg1 output) layers (lambda (k1) (return-value* (arg2 output) layers (lambda (k2) (cc (do-math (car output) k1 k2)))))))
-      ((comparison? output) (return-value* (arg1 output) layers (lambda (k1) (return-value* (arg2 output) layers (lambda (k2) (cc (compare (car output) k1 k2)))))))
-      ((boolean-expression? output) (return-value* (arg1 output) layers (lambda (k1) (return-value* (arg2 output) layers (lambda (k2) (cc (boolean (car output) k1 k2)))))))
+      ((null? output) (cc null layers))
+      ((number? output) (cc output layers))
+      ((boolean? output) (cc output layers))
+      ((eq? 'true output) (cc #t layers))
+      ((eq? 'false output) (cc #f layers))
+      ((atom? output) (cc (get-variable* output layers) layers))
+      ((math? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (do-math (car output) k1 k2) s2))))))
+      ((comparison? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (compare (car output) k1 k2) s2))))))
+      ((boolean-expression? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (boolean (car output) k1 k2) s2))))))
+      ((assignment? output) (return-value* (arg2 output) layers (lambda (k s) (set-variable* (arg1 output) k s (lambda (updated-layers) (cc k updated-layers))))))
       (else (return-value* (car output) layers cc)))))
 
 (define (atom? x) (and (not (null? x)) (not (pair? x)))) ; Checks if a list item is an atom (i.e. a non-null, non-list object)
@@ -235,7 +236,7 @@
 (define set-variable-cps
   (lambda (var-name val variables return)
     (cond
-      ((empty? variables) (error (string-append "The variable " (symbol->string var-name) " must be declared before it can be assigned a value!")))
+      ((empty? variables) (error (string-append "The variable \"" (symbol->string var-name) "\" must be declared before it can be assigned a value!")))
       ((eq? (name (car variables)) var-name) (return (add-variable var-name val (cdr variables))))
       (else (set-variable-cps var-name val (cdr variables) (lambda (k) (return (cons (car variables) k))))))))
 (define set-variable
@@ -245,6 +246,6 @@
 (define set-variable*
   (lambda (var-name val layers next)
     (cond
-      ((empty? layers) (error (string-append "The variable " (symbol->string var-name) " must be declared before it can be assigned a value!")))
-      ((var-exists? var-name (car layers)) (next (set-variable-cps var-name val (car layers) (lambda (k) (cons k (cdr layers))))))
-      (else (next (set-variable* var-name val (cdr layers) (lambda (k) (cons (car layers) k))))))))
+      ((empty? layers) (error (string-append "The variable \"" (symbol->string var-name) "\" must be declared before it can be assigned a value!")))
+      ((var-exists? var-name (car layers)) (next (cons (set-variable var-name val (car layers)) (cdr layers))))
+      (else (set-variable* var-name val (cdr layers) (lambda (k) (next (cons (car layers) k))))))))
