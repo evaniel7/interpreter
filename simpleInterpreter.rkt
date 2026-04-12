@@ -5,7 +5,10 @@
 
 ; Interprets the code contained in the file with the inputted filename
 (define interpret*
-  (lambda (filename) (translate-booleans (interpret-raw-code* (parser filename) '()))))
+  (lambda (filename)
+    (translate-booleans
+     (call-main
+      (interpret-raw-code* (parser filename) '())))))
 
 ; Replaces "#t" with "true" and "#f" with "false", but leaves the inputted value untouched otherwise
 (define translate-booleans
@@ -16,8 +19,33 @@
 (define call-main
   (lambda (layers)
     (if (and (var-exists*? 'main layers) (is-function? 'main layers))
-        (interpret-raw-code* '() layers)
+        (execute-main-closure (get-variable* 'main layers) layers)
         (error "No main() function has been defined in the code!"))))
+
+; Helper to take the stored closure for main and prepare its environment
+(define execute-main-closure
+  (lambda (closure layers)
+    (let ((main-binding (new-variable 'main closure)))
+      (execute-function-body
+       (func-body main-binding)
+       ((env-function main-binding) layers)))))
+
+; Helper to walk through the statements inside the function body one at a time
+(define execute-function-body
+  (lambda (code layers)
+    (cond
+      ((null? code) null)
+      (else
+       (interpret-statement*
+        (car code)
+        layers
+        (lambda (new-layers)
+          (execute-function-body (cdr code) new-layers))
+        value-state
+        (lambda (layers) (error "Continue statements must be inside of a loop!"))
+        (lambda (layers) (error "Break statements must be inside of a loop!"))
+        (lambda (v s) (error "Uncaught exception:" v)))))))
+
 
 ; Interprets the inputted pre-parsed code one statement at a time, or returns the value of the current statement if it is a "return" statement 
 (define interpret-raw-code*
