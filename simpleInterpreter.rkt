@@ -1,6 +1,6 @@
 #lang racket
 
-(require "simpleParser.rkt")
+(require "functionParser.rkt")
 (require racket/trace) ; Enables the use of the "trace" function (for debugging purposes)
 
 ; Interprets the code contained in the file with the inputted filename
@@ -11,6 +11,13 @@
 (define translate-booleans
   (lambda (output)
     (if (boolean? output) (if (eq? output #t) 'true 'false) output)))
+
+; Calls the main() function and returns its output
+(define call-main
+  (lambda (layers)
+    (if (and (var-exists*? 'main layers) (is-function? 'main layers))
+        (interpret-raw-code* '() layers)
+        (error "No main() function has been defined in the code!"))))
 
 ; Interprets the inputted pre-parsed code one statement at a time, or returns the value of the current statement if it is a "return" statement 
 (define interpret-raw-code*
@@ -40,13 +47,33 @@
 (define (continue? statement) (eq? 'continue (car statement))) ; Checks if the inputted statement is a "continue" statement
 (define (break? statement) (eq? 'break (car statement))) ; Checks if the inputted statement is a "break" statement
 (define (try? statement) (eq? 'try (car statement))) ; Checks if a statement corresponds to a try-catch block
-(define (throw? statement) (eq? 'throw (car statement))) ; Check if a statement is throwing a value/exception
+(define (throw? statement) (eq? 'throw (car statement))) ; Checks if a statement is throwing a value/exception
+(define (function-def? statement) (eq? 'function (car statement))) ; Checks if a statement is defining a function
+(define (function-call? statement) (eq? 'funcall (car statement))) ; Checks if a statement is calling a function
 
 ; Adds a new layer to the front of the layers list
 (define new-layer
   (lambda (layers) (cons '() layers)))
 
 (define value-state (lambda (v s) v)) ; Default return/throw continuation function defined here for convenience
+
+(define bind-formal-params
+  (lambda (formal-params)
+    (if (null? formal-params)
+        '()
+        (cons (new-variable (car formal-params) '()) (bind-formal-params (cdr formal-params))))))
+
+; Returns an anonymous function that constructs a function's environment
+(define construct-environment
+  (lambda (formal-params body)
+    (lambda (outer-state)
+      (append (bind-formal-params formal-params)
+            (list (foldl (lambda (k acc)
+                           (if (and (atom? k) (var-exists*? k outer-state))
+                               (cons (new-variable k (get-variable* k outer-state)) acc)
+                               acc))
+                         '()
+                         (flatten body)))))))
 
 ; Updates the program's variable layers by executing the inputted statement, or returning its associated value if it is a "return" statement
 (define interpret-statement*
@@ -63,6 +90,7 @@
       ((if-statement? statement) (if-statement* (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
       ((while-statement? statement) (while-statement* (arg1 statement) (arg2 statement) layers next return continue break throw))
       ((return? statement) (return-value* (cdr statement) layers (lambda (k s) (return k s))))
+      ((function-def? statement) (add-variable* (arg1 statement) (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement))) layers next))
       (else (error "The following statement count not be parsed: " statement)))))
 
 ; Handles execution of code blocks, automatically removing the block's variable layer once execution is finished
@@ -194,6 +222,16 @@
 
 (define (var-exists? var-name variables) (if (assoc var-name variables) #t #f)) ; Checks if a variable with the inputted name exists within a given layer
 (define (var-exists*? var-name layers) (ormap (lambda (k) (var-exists? var-name k)) layers)) ; Checks if a variable with the inputted name exists in general
+(define (is-function? var-name layers) (list? (get-variable* var-name layers))) ; Checks if the "variable" with the inputted name is a function
+
+; Creates a 3-tuple of a function's formal parameters, body, and environment function to represent its closure
+(define create-closure
+  (lambda (formal-params body env-func)
+    (list (cons formal-params (cons body env-func)))))
+
+(define (params binding) (car (car (value binding)))) ; Gets the formal parameters from a function's name-closure binding
+(define (func-body binding) (arg1 (car (value binding)))) ; Gets the function body from a function's name-closure binding
+(define (env-function binding) (cdr (cdr (car (value binding))))) ; Gets the environment function from a function's name-closure binding
 
 ; Adds a new variable with the inputted name and value if it doesn't already exist
 (define add-variable
