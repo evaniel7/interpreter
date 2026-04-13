@@ -5,7 +5,7 @@
 
 ; Interprets the code contained in the file with the inputted filename
 (define interpret*
-  (lambda (filename) (translate-booleans (call-main (interpret-raw-code* (parser filename) '() value-state (lambda (v s) (error "Uncaught exception:" v)))))))
+  (lambda (filename) (translate-booleans (call-main (interpret-raw-code* (parser filename) '() value-state (lambda (s) s) (lambda (v s) (error "Uncaught exception:" v)))))))
 
 ; Replaces "#t" with "true" and "#f" with "false", but leaves the inputted value untouched otherwise
 (define translate-booleans
@@ -21,14 +21,14 @@
 
 ; Interprets the inputted pre-parsed code one statement at a time, or returns the value of the current statement if it is a "return" statement 
 (define interpret-raw-code*
-  (lambda (code layers return throw)
+  (lambda (code layers return fallthrough throw)
     (cond
-      ((null? code) layers)
+      ((null? code) (fallthrough layers))
       (else (interpret-statement*
         (car code)
         layers
-        (lambda (v) (interpret-raw-code* (cdr code) v return throw))
-        return                          
+        (lambda (v) (interpret-raw-code* (cdr code) v return fallthrough throw))
+        return
         (lambda (layers) (error "Continue statements must be inside of a loop!"))
         (lambda (layers) (error "Break statements must be inside of a loop!"))
         throw)))))
@@ -204,8 +204,11 @@
 ; Computes the values of the parameters inputted into a function call and binds them to the formal parameters in the function environment
 (define compute-params
   (lambda (params inputs layers environment cc throw)
-    (if (null? params)
-        (cc environment)
+    (cond
+      ((and (null? params) (null? inputs)) (cc environment))
+      ((or (null? params) (null? inputs))
+       (error "Mismatched number of arguments in function call!"))
+      (else
         (return-value*
           (car inputs)
           layers
@@ -214,7 +217,7 @@
             v
             environment
             (lambda (updated-env) (compute-params (cdr params) (cdr inputs) layers updated-env cc throw))))
-          throw))))
+          throw)))))
 
 ; Calls the function with the specified name and evaluates it with the specified values for its parameters
 (define call-function
@@ -230,12 +233,13 @@
             layers
             env
             (lambda (env)
-              (let ((result (interpret-raw-code* (func-body closure) (remove-param-placeholders env)
-                              (lambda (v s)
-                                (cc v (propagate-mutations layers s))) throw)))
-                (if (list? result)
-                    (cc null (propagate-mutations layers result))
-                    result)))
+              (interpret-raw-code* (func-body closure) (remove-param-placeholders env)
+                (lambda (v s)
+                  (cc v (propagate-mutations layers s)))
+                (lambda (s)
+                  (cc null (propagate-mutations layers s)))
+                (lambda (v s)
+                  (throw v (propagate-mutations layers s)))))
             throw))
         (error (string-append "The function \"" (symbol->string name) "()\" has not yet been defined!")))))
 
