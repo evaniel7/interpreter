@@ -5,7 +5,7 @@
 
 ; Interprets the code contained in the file with the inputted filename
 (define interpret*
-  (lambda (filename) (translate-booleans (call-main (interpret-raw-code* (parser filename) '() value-state)))))
+  (lambda (filename) (translate-booleans (call-main (interpret-raw-code* (parser filename) '() value-state (lambda (v s) (error "Uncaught exception:" v)))))))
 
 ; Replaces "#t" with "true" and "#f" with "false", but leaves the inputted value untouched otherwise
 (define translate-booleans
@@ -16,22 +16,22 @@
 (define call-main
   (lambda (layers)
     (if (and (var-exists*? 'main layers) (is-function? 'main layers))
-        (call-function 'main '() layers value-state)
+        (call-function 'main '() layers value-state (lambda (v s) (error "Uncaught exception:" v)))
         (error "No main() function has been defined in the code!"))))
 
 ; Interprets the inputted pre-parsed code one statement at a time, or returns the value of the current statement if it is a "return" statement 
 (define interpret-raw-code*
-  (lambda (code layers return)
+  (lambda (code layers return throw)
     (cond
       ((null? code) layers)
       (else (interpret-statement*
         (car code)
         layers
-        (lambda (v) (interpret-raw-code* (cdr code) v return))
+        (lambda (v) (interpret-raw-code* (cdr code) v return throw))
         return                          
         (lambda (layers) (error "Continue statements must be inside of a loop!"))
         (lambda (layers) (error "Break statements must be inside of a loop!"))
-        (lambda (v s) (error "Uncaught exception:" v)))))))
+        throw)))))
 
 ; Shortcuts to get the 1st, 2nd, and 3rd arguments of a statement, whenever they exist
 (define (arg1 statement) (car (cdr statement))) 
@@ -90,15 +90,15 @@
       ((null? statement) (next layers))
       ((block? statement) (execute-block (cdr statement) (new-layer layers) next return continue break throw))
       ((try? statement) (try-catch-block (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
-      ((throw? statement) (return-value* (cdr statement) layers (lambda (k s) (throw k s))))
+      ((throw? statement) (return-value* (cdr statement) layers (lambda (k s) (throw k s)) throw))
       ((continue? statement) (continue layers))
       ((break? statement) (break layers))
-      ((function-call? statement) (call-function (arg1 statement) (cdr (cdr statement)) layers (lambda (v s) (next s))))
-      ((declaration? statement) (return-value* (arg2 statement) layers (lambda (k s) (add-variable* (arg1 statement) k s next))))
-      ((assignment? statement) (return-value* (arg2 statement) layers (lambda (k s) (set-variable* (arg1 statement) k s next))))
+      ((function-call? statement) (call-function (arg1 statement) (cdr (cdr statement)) layers (lambda (v s) (next s)) throw))
+      ((declaration? statement) (return-value* (arg2 statement) layers (lambda (k s) (add-variable* (arg1 statement) k s next)) throw))
+      ((assignment? statement) (return-value* (arg2 statement) layers (lambda (k s) (set-variable* (arg1 statement) k s next)) throw))
       ((if-statement? statement) (if-statement* (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
       ((while-statement? statement) (while-statement* (arg1 statement) (arg2 statement) layers next return continue break throw))
-      ((return? statement) (return-value* (cdr statement) layers (lambda (k s) (return k s))))
+      ((return? statement) (return-value* (cdr statement) layers (lambda (k s) (return k s)) throw))
       ((function-def? statement) (add-variable*
         (arg1 statement)
         (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement) layers))
@@ -158,15 +158,20 @@
 ; Executes the inputted "if" statement and updates the program's variable layers accordingly
 (define if-statement*
   (lambda (condition if-true else layers next return continue break throw)
-    (return-value* condition layers
+    (return-value*
+      condition
+      layers
       (lambda (condition-result side-effect) (if condition-result
         (interpret-statement* if-true side-effect next return continue break throw)
-        (interpret-statement* else side-effect next return continue break throw))))))
+        (interpret-statement* else side-effect next return continue break throw)))
+      throw)))
 
 ; Executes the inputted "while" statement and updates the program's variable layers accordingly
 (define while-statement*
   (lambda (condition body layers next return continue break throw)
-    (return-value* condition layers
+    (return-value*
+      condition
+      layers
       (lambda (condition-result side-effect) (if condition-result
         (interpret-statement*
           body
@@ -176,11 +181,12 @@
           (lambda (new-layers) (while-statement* condition body new-layers next return continue break throw))
           next
           throw)
-        (next side-effect))))))
+        (next side-effect)))
+      throw)))
 
 ; Interprets simple statements (i.e. expressions) and returns their results
 (define return-value*
-  (lambda (output layers cc)
+  (lambda (output layers cc throw)
     (cond
       ((null? output) (cc null layers))
       ((number? output) (cc output layers))
@@ -188,16 +194,16 @@
       ((eq? 'true output) (cc #t layers))
       ((eq? 'false output) (cc #f layers))
       ((atom? output) (cc (get-variable* output layers) layers))
-      ((math? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (do-math (car output) k1 k2) s2))))))
-      ((comparison? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (compare (car output) k1 k2) s2))))))
-      ((boolean-expression? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (boolean (car output) k1 k2) s2))))))
-      ((assignment? output) (return-value* (arg2 output) layers (lambda (k s) (set-variable* (arg1 output) k s (lambda (updated-layers) (cc k updated-layers))))))
-      ((function-call? output) (call-function (arg1 output) (cdr (cdr output)) layers (lambda (v s) (cc v s))))
-      (else (return-value* (car output) layers cc)))))
+      ((math? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (do-math (car output) k1 k2) s2)) throw)) throw))
+      ((comparison? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (compare (car output) k1 k2) s2)) throw)) throw))
+      ((boolean-expression? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (boolean (car output) k1 k2) s2)) throw)) throw))
+      ((assignment? output) (return-value* (arg2 output) layers (lambda (k s) (set-variable* (arg1 output) k s (lambda (updated-layers) (cc k updated-layers)))) throw))
+      ((function-call? output) (call-function (arg1 output) (cdr (cdr output)) layers (lambda (v s) (cc v s)) throw))
+      (else (return-value* (car output) layers cc throw)))))
 
 ; Computes the values of the parameters inputted into a function call and binds them to the formal parameters in the function environment
 (define compute-params
-  (lambda (params inputs layers environment cc)
+  (lambda (params inputs layers environment cc throw)
     (if (null? params)
         (cc environment)
         (return-value*
@@ -207,11 +213,12 @@
             (car params)
             v
             environment
-            (lambda (updated-env) (compute-params (cdr params) (cdr inputs) layers updated-env cc))))))))
+            (lambda (updated-env) (compute-params (cdr params) (cdr inputs) layers updated-env cc throw))))
+          throw))))
 
 ; Calls the function with the specified name and evaluates it with the specified values for its parameters
 (define call-function
-  (lambda (name inputs layers cc)
+  (lambda (name inputs layers cc throw)
     (if (and (var-exists*? name layers) (is-function? name layers))
         (let* ((closure (get-variable* name layers))
                (func-env ((env-function closure) layers))
@@ -225,10 +232,11 @@
             (lambda (env)
               (let ((result (interpret-raw-code* (func-body closure) (remove-param-placeholders env)
                               (lambda (v s)
-                                (cc v (propagate-mutations layers s))))))
+                                (cc v (propagate-mutations layers s))) throw)))
                 (if (list? result)
                     (cc null (propagate-mutations layers result))
-                    result)))))
+                    result)))
+            throw))
         (error (string-append "The function \"" (symbol->string name) "()\" has not yet been defined!")))))
 
 ; Removes bindings with uninitialized values (var declared but not assigned)
