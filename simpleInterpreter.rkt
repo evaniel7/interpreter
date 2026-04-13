@@ -225,8 +225,7 @@
     (if (and (var-exists*? name layers) (is-function? name layers))
         (let* ((closure (get-variable* name layers))
                (func-env ((env-function closure) layers))
-               (clean-caller-layers (remove-uninitialized layers))
-               (env (cons '() (append func-env clean-caller-layers))))
+               (env (cons '() (append func-env layers))))
           (compute-params
             (params closure)
             inputs
@@ -320,7 +319,9 @@
 
 (define (var-exists? var-name variables) (if (assoc var-name variables) #t #f)) ; Checks if a variable with the inputted name exists within a given layer
 (define (var-exists*? var-name layers) (ormap (lambda (k) (var-exists? var-name k)) layers)) ; Checks if a variable with the inputted name exists in general
-(define (is-function? var-name layers) (list? (get-variable* var-name layers))) ; Checks if the "variable" with the inputted name is a function
+(define (is-function? var-name layers) ; Checks if the "variable" with the inputted name is a function
+  (let ((val (get-variable* var-name layers)))
+    (and (not (null? val)) (list? val)))) 
 
 ; Creates a 3-tuple of a function's formal parameters, body, and environment function to represent its closure
 (define create-closure
