@@ -67,21 +67,36 @@
 ; Returns an anonymous function that constructs a function's environment
 (define construct-environment
   (lambda (formal-params body outer-state)
-    (let ((param-layer (bind-formal-params formal-params)) ; Keep the params! 
-          (func-layer (foldl (lambda (k acc)
-                               (if (and (atom? k)
-                                        (not (member k formal-params))
-                                        (not (var-exists? k acc))
-                                        (var-exists*? k outer-state)
-                                        (is-function? k outer-state)) ; Keep only functions 
-                                   (cons (new-variable k (get-variable* k outer-state)) acc)
-                                   acc))
-                             '()
-                             (append (flatten body) (flatten outer-state))))) ; Scan for function names
+    (let* ((body-atoms (flatten body))
+           (written-vars (get-assigned-vars body)) ; variables assigned anywhere in body
+           (param-layer (bind-formal-params formal-params))
+           (func-layer (foldl (lambda (k acc)
+                                (if (and (atom? k)
+                                         (not (member k formal-params))
+                                         (not (var-exists? k acc))
+                                         (var-exists*? k outer-state)
+                                         (or (is-function? k outer-state)
+                                             (and (member k body-atoms)
+                                                  (not (member k written-vars))))) ; read-only
+                                    (cons (new-variable k (get-variable* k outer-state)) acc)
+                                    acc))
+                              '()
+                              (append body-atoms (flatten outer-state)))))
       (lambda (call-time-state)
         (if (null? param-layer)
-            (list func-layer)
+            (list param-layer func-layer)
             (list param-layer func-layer))))))
+
+; Helper function for getting only assigned variables from the function body
+(define get-assigned-vars
+  (lambda (body)
+    (foldl (lambda (stmt acc)
+             (cond
+               ((and (pair? stmt) (assignment? stmt)) (cons (arg1 stmt) acc))
+               ((pair? stmt) (append (get-assigned-vars stmt) acc))
+               (else acc)))
+           '()
+           body)))
 
 ; Updates the program's variable layers by executing the inputted statement, or returning its associated value if it is a "return" statement
 (define interpret-statement*
