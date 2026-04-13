@@ -67,26 +67,21 @@
 ; Returns an anonymous function that constructs a function's environment
 (define construct-environment
   (lambda (formal-params body outer-state)
-    (let ((param-layer (bind-formal-params formal-params))
-          (global-layer (foldl (lambda (k acc)
-                                 (if (and (atom? k)
-                                          (not (member k formal-params))
-                                          (not (var-exists? k acc))
-                                          (var-exists*? k outer-state)
-                                          (is-function? k outer-state)) ; only capture functions
-                                     (cons (new-variable k (get-variable* k outer-state)) acc)
-                                     acc))
-                               '()
-                               (append
-                                 (flatten body)
-                                 (foldl (lambda (layer acc)
-                                          (append (map name layer) acc))
-                                        '()
-                                        outer-state)))))
+    (let ((param-layer (bind-formal-params formal-params)) ; Keep the params! 
+          (func-layer (foldl (lambda (k acc)
+                               (if (and (atom? k)
+                                        (not (member k formal-params))
+                                        (not (var-exists? k acc))
+                                        (var-exists*? k outer-state)
+                                        (is-function? k outer-state)) ; Keep only functions 
+                                   (cons (new-variable k (get-variable* k outer-state)) acc)
+                                   acc))
+                             '()
+                             (append (flatten body) (flatten outer-state))))) ; Scan for function names
       (lambda (call-time-state)
         (if (null? param-layer)
-            (list global-layer)
-            (list param-layer global-layer))))))
+            (list func-layer)
+            (list param-layer func-layer))))))
 
 ; Updates the program's variable layers by executing the inputted statement, or returning its associated value if it is a "return" statement
 (define interpret-statement*
@@ -218,30 +213,59 @@
 (define call-function
   (lambda (name inputs layers cc)
     (if (and (var-exists*? name layers) (is-function? name layers))
-      (let* ((closure (get-variable* name layers)) (env (append (new-layer ((env-function closure) layers)) layers)))
-        (if (= (length inputs) (length (params closure)))
+        (let* ((closure (get-variable* name layers))
+               (func-env ((env-function closure) layers))
+               (clean-caller-layers (remove-uninitialized layers))
+               (env (cons '() (append func-env clean-caller-layers))))
           (compute-params
-          (params closure)
-          inputs
-          layers
-          env
-          (lambda (e) (let ((result (interpret-raw-code* (func-body closure) e (lambda (v s) (cc v (propagate-mutations layers s))))))
-            (if (list? result)
-              (cc null (propagate-mutations layers result))
-              result))))
-          (error (string-append "Wrong number of parameters for \"" (symbol->string name) "(" (string-join (map symbol->string (params closure)) ", ") ")\"!"))))
-      (error (string-append "The function \"" (symbol->string name) "()\" has not yet been defined!")))))
+            (params closure)
+            inputs
+            layers
+            env
+            (lambda (env)
+              (let ((result (interpret-raw-code* (func-body closure) (remove-param-placeholders env)
+                              (lambda (v s)
+                                (cc v (propagate-mutations layers s))))))
+                (if (list? result)
+                    (cc null (propagate-mutations layers result))
+                    result)))))
+        (error (string-append "The function \"" (symbol->string name) "()\" has not yet been defined!")))))
+
+; Removes bindings with uninitialized values (var declared but not assigned)
+(define remove-uninitialized
+  (lambda (layers)
+    (map (lambda (layer)
+           (filter (lambda (binding)
+                     (not (equal? (cdr binding) '())))
+                   layer))
+         layers)))
+
+; Removes param placeholder bindings created by bind-formal-params
+(define remove-param-placeholders
+  (lambda (layers)
+    (map (lambda (layer)
+           (filter (lambda (binding)
+                     (not (equal? (cdr binding) '(()))))
+                   layer))
+         layers)))
 
 ; Updates the caller's layers with any changes made to shared variables during the function call
 (define propagate-mutations
   (lambda (caller-layers post-call-layers)
-    (map (lambda (layer)
-           (map (lambda (binding)
-                  (if (and (pair? binding) (var-exists*? (name binding) post-call-layers))
-                      (new-variable (name binding) (get-variable* (name binding) post-call-layers))
-                      binding))
-                layer))
-         caller-layers)))
+    (if (or (null? caller-layers) (null? post-call-layers))
+        caller-layers
+        (let* ((caller-depth (length caller-layers))
+               (post-depth (length post-call-layers))
+               (offset (- post-depth caller-depth))
+               (aligned-post (list-tail post-call-layers offset)))
+          (map (lambda (caller-layer post-layer)
+                 (map (lambda (binding)
+                        (if (and (pair? binding) (var-exists? (name binding) post-layer))
+                            (new-variable (name binding) (get-variable (name binding) post-layer))
+                            binding))
+                      caller-layer))
+               caller-layers
+               aligned-post)))))
 
 (define (atom? x) (and (not (null? x)) (not (pair? x)))) ; Checks if a list item is an atom (i.e. a non-null, non-list object)
 (define (math? statement) (set-member? (set '+ '- '* '/ '%) (car statement))) ; Checks if the statement is just simple arithemetic 
@@ -349,3 +373,36 @@
       ((empty? layers) (error (string-append "The variable \"" (symbol->string var-name) "\" must be declared before it can be assigned a value!")))
       ((var-exists? var-name (car layers)) (next (cons (set-variable var-name val (car layers)) (cdr layers))))
       (else (set-variable* var-name val (cdr layers) (lambda (k) (next (cons (car layers) k))))))))
+
+; Helper to run a single test safely
+(define run-test
+  (lambda (label filename)
+    (begin
+      (display label)
+      (with-handlers ([exn? (lambda (e) (writeln (exn-message e)))])
+        (writeln (interpret* filename))))))
+
+; Runs every test for Project 3 at once
+(define test-all
+  (lambda ()
+    (begin
+      (run-test "Test 1: " "test3-1.rkt")
+      (run-test "Test 2: " "test3-2.rkt")
+      (run-test "Test 3: " "test3-3.rkt")
+      (run-test "Test 4: " "test3-4.rkt")
+      (run-test "Test 5: " "test3-5.rkt")
+      (run-test "Test 6: " "test3-6.rkt")
+      (run-test "Test 7: " "test3-7.rkt")
+      (run-test "Test 8: " "test3-8.rkt")
+      (run-test "Test 9: " "test3-9.rkt")
+      (run-test "Test 10: " "test3-10.rkt")
+      (run-test "Test 11: " "test3-11.rkt")
+      (run-test "Test 12: " "test3-12.rkt")
+      (run-test "Test 13: " "test3-13.rkt")
+      (run-test "Test 14: " "test3-14.rkt")
+      (run-test "Test 15: " "test3-15.rkt")
+      (run-test "Test 16: " "test3-16.rkt")
+      (run-test "Test 17: " "test3-17.rkt")
+      (run-test "Test 18: " "test3-18.rkt")
+      (run-test "Test 19: " "test3-19.rkt")
+      (run-test "Test 20: " "test3-20.rkt"))))
