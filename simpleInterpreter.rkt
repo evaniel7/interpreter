@@ -5,10 +5,7 @@
 
 ; Interprets the code contained in the file with the inputted filename
 (define interpret*
-  (lambda (filename)
-    (translate-booleans
-     (call-main
-      (interpret-raw-code* (parser filename) '())))))
+  (lambda (filename) (translate-booleans (call-main (interpret-raw-code* (parser filename) '() value-state)))))
 
 ; Replaces "#t" with "true" and "#f" with "false", but leaves the inputted value untouched otherwise
 (define translate-booleans
@@ -19,44 +16,19 @@
 (define call-main
   (lambda (layers)
     (if (and (var-exists*? 'main layers) (is-function? 'main layers))
-        (execute-main-closure (get-variable* 'main layers) layers)
+        (call-function 'main '() layers value-state)
         (error "No main() function has been defined in the code!"))))
-
-; Helper to take the stored closure for main and prepare its environment
-(define execute-main-closure
-  (lambda (closure layers)
-    (let ((main-binding (new-variable 'main closure)))
-      (execute-function-body
-       (func-body main-binding)
-       ((env-function main-binding) layers)))))
-
-; Helper to walk through the statements inside the function body one at a time
-(define execute-function-body
-  (lambda (code layers)
-    (cond
-      ((null? code) null)
-      (else
-       (interpret-statement*
-        (car code)
-        layers
-        (lambda (new-layers)
-          (execute-function-body (cdr code) new-layers))
-        value-state
-        (lambda (layers) (error "Continue statements must be inside of a loop!"))
-        (lambda (layers) (error "Break statements must be inside of a loop!"))
-        (lambda (v s) (error "Uncaught exception:" v)))))))
-
 
 ; Interprets the inputted pre-parsed code one statement at a time, or returns the value of the current statement if it is a "return" statement 
 (define interpret-raw-code*
-  (lambda (code layers)
+  (lambda (code layers return)
     (cond
       ((null? code) layers)
       (else (interpret-statement*
         (car code)
         layers
-        (lambda (v) (interpret-raw-code* (cdr code) v))
-        value-state
+        (lambda (v) (interpret-raw-code* (cdr code) v return))
+        return                          
         (lambda (layers) (error "Continue statements must be inside of a loop!"))
         (lambda (layers) (error "Break statements must be inside of a loop!"))
         (lambda (v s) (error "Uncaught exception:" v)))))))
@@ -85,23 +57,36 @@
 
 (define value-state (lambda (v s) v)) ; Default return/throw continuation function defined here for convenience
 
+; Converts a set of function parameters into a list of variable bindings
 (define bind-formal-params
   (lambda (formal-params)
     (if (null? formal-params)
         '()
-        (cons (new-variable (car formal-params) '()) (bind-formal-params (cdr formal-params))))))
+        (cons (new-variable (car formal-params) '(())) (bind-formal-params (cdr formal-params))))))
 
 ; Returns an anonymous function that constructs a function's environment
 (define construct-environment
-  (lambda (formal-params body)
-    (lambda (outer-state)
-      (append (bind-formal-params formal-params)
-            (list (foldl (lambda (k acc)
-                           (if (and (atom? k) (var-exists*? k outer-state))
-                               (cons (new-variable k (get-variable* k outer-state)) acc)
-                               acc))
-                         '()
-                         (flatten body)))))))
+  (lambda (formal-params body outer-state)
+    (let ((param-layer (bind-formal-params formal-params))
+          (global-layer (foldl (lambda (k acc)
+                                 (if (and (atom? k)
+                                          (not (member k formal-params))
+                                          (not (var-exists? k acc))
+                                          (var-exists*? k outer-state)
+                                          (is-function? k outer-state)) ; only capture functions
+                                     (cons (new-variable k (get-variable* k outer-state)) acc)
+                                     acc))
+                               '()
+                               (append
+                                 (flatten body)
+                                 (foldl (lambda (layer acc)
+                                          (append (map name layer) acc))
+                                        '()
+                                        outer-state)))))
+      (lambda (call-time-state)
+        (if (null? param-layer)
+            (list global-layer)
+            (list param-layer global-layer))))))
 
 ; Updates the program's variable layers by executing the inputted statement, or returning its associated value if it is a "return" statement
 (define interpret-statement*
@@ -113,12 +98,17 @@
       ((throw? statement) (return-value* (cdr statement) layers (lambda (k s) (throw k s))))
       ((continue? statement) (continue layers))
       ((break? statement) (break layers))
+      ((function-call? statement) (call-function (arg1 statement) (cdr (cdr statement)) layers (lambda (v s) (next s))))
       ((declaration? statement) (return-value* (arg2 statement) layers (lambda (k s) (add-variable* (arg1 statement) k s next))))
       ((assignment? statement) (return-value* (arg2 statement) layers (lambda (k s) (set-variable* (arg1 statement) k s next))))
       ((if-statement? statement) (if-statement* (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
       ((while-statement? statement) (while-statement* (arg1 statement) (arg2 statement) layers next return continue break throw))
       ((return? statement) (return-value* (cdr statement) layers (lambda (k s) (return k s))))
-      ((function-def? statement) (add-variable* (arg1 statement) (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement))) layers next))
+      ((function-def? statement) (add-variable*
+        (arg1 statement)
+        (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement) layers))
+        layers
+        next))
       (else (error "The following statement count not be parsed: " statement)))))
 
 ; Handles execution of code blocks, automatically removing the block's variable layer once execution is finished
@@ -207,7 +197,51 @@
       ((comparison? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (compare (car output) k1 k2) s2))))))
       ((boolean-expression? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (boolean (car output) k1 k2) s2))))))
       ((assignment? output) (return-value* (arg2 output) layers (lambda (k s) (set-variable* (arg1 output) k s (lambda (updated-layers) (cc k updated-layers))))))
+      ((function-call? output) (call-function (arg1 output) (cdr (cdr output)) layers (lambda (v s) (cc v s))))
       (else (return-value* (car output) layers cc)))))
+
+; Computes the values of the parameters inputted into a function call and binds them to the formal parameters in the function environment
+(define compute-params
+  (lambda (params inputs layers environment cc)
+    (if (null? params)
+        (cc environment)
+        (return-value*
+          (car inputs)
+          layers
+          (lambda (v s) (set-variable*
+            (car params)
+            v
+            environment
+            (lambda (updated-env) (compute-params (cdr params) (cdr inputs) layers updated-env cc))))))))
+
+; Calls the function with the specified name and evaluates it with the specified values for its parameters
+(define call-function
+  (lambda (name inputs layers cc)
+    (if (and (var-exists*? name layers) (is-function? name layers))
+      (let* ((closure (get-variable* name layers)) (env (append (new-layer ((env-function closure) layers)) layers)))
+        (if (= (length inputs) (length (params closure)))
+          (compute-params
+          (params closure)
+          inputs
+          layers
+          env
+          (lambda (e) (let ((result (interpret-raw-code* (func-body closure) e (lambda (v s) (cc v (propagate-mutations layers s))))))
+            (if (list? result)
+              (cc null (propagate-mutations layers result))
+              result))))
+          (error (string-append "Wrong number of parameters for \"" (symbol->string name) "(" (string-join (map symbol->string (params closure)) ", ") ")\"!"))))
+      (error (string-append "The function \"" (symbol->string name) "()\" has not yet been defined!")))))
+
+; Updates the caller's layers with any changes made to shared variables during the function call
+(define propagate-mutations
+  (lambda (caller-layers post-call-layers)
+    (map (lambda (layer)
+           (map (lambda (binding)
+                  (if (and (pair? binding) (var-exists*? (name binding) post-call-layers))
+                      (new-variable (name binding) (get-variable* (name binding) post-call-layers))
+                      binding))
+                layer))
+         caller-layers)))
 
 (define (atom? x) (and (not (null? x)) (not (pair? x)))) ; Checks if a list item is an atom (i.e. a non-null, non-list object)
 (define (math? statement) (set-member? (set '+ '- '* '/ '%) (car statement))) ; Checks if the statement is just simple arithemetic 
@@ -257,9 +291,9 @@
   (lambda (formal-params body env-func)
     (list (cons formal-params (cons body env-func)))))
 
-(define (params binding) (car (car (value binding)))) ; Gets the formal parameters from a function's name-closure binding
-(define (func-body binding) (arg1 (car (value binding)))) ; Gets the function body from a function's name-closure binding
-(define (env-function binding) (cdr (cdr (car (value binding))))) ; Gets the environment function from a function's name-closure binding
+(define (params closure) (car (car closure))) ; Gets the formal parameters from a function's closure
+(define (func-body closure) (arg1 (car closure))) ; Gets the function body from a function's closure
+(define (env-function closure) (cdr (cdr (car closure)))) ; Gets the environment function from a function's closure
 
 ; Adds a new variable with the inputted name and value if it doesn't already exist
 (define add-variable
@@ -274,7 +308,7 @@
   (lambda (var-name value layers next)
     (cond
       ((empty? layers) (next (list (list (new-variable var-name value)))))
-      ((var-exists*? var-name layers) (error (string-append "The variable \"" (symbol->string var-name) "\" already exists!")))
+      ((var-exists? var-name (car layers)) (error (string-append "The variable \"" (symbol->string var-name) "\" already exists!")))
       (else (next (cons (cons (new-variable var-name value) (car layers)) (cdr layers)))))))
 
 (define (value binding) (cdr binding)) ; Gets the "value" part of a name-value binding
