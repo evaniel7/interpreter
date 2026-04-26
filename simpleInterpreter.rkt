@@ -24,7 +24,7 @@
 (define get-class-functions
   (lambda (class-body)
     (filter
-      (lambda (k) (list? (value k)))
+      (lambda (k) (eq? (get-type (value k)) 'function))
       (car (interpret-raw-code* class-body '() value-state values (lambda (v s) (error "Uncaught exception:" v)))))))
 
 ; Replaces "#t" with "true" and "#f" with "false", but leaves the inputted value untouched otherwise
@@ -38,7 +38,7 @@
     (if (var-exists*? classname classdefs)
         (let* ((class-contents (list (class-functions (car (get-variable* classname classdefs))))))
           (if (var-exists*? 'main class-contents)
-            (call-function 'main '() class-contents value-state (lambda (v s) (error "Uncaught exception:" v)))
+            (call-function 'main '() (append class-contents classdefs) value-state (lambda (v s) (error "Uncaught exception:" v)))
             (error "No main() function has been defined in the code for class:" classname)))
         (error (string-append "The class \"" (symbol->string classname) "\" does not exist!")))))
 
@@ -77,6 +77,7 @@
 
 (define (class-def? statement) (eq? 'class (car statement))) ; Checks if a statement is defining a class
 (define (static-f-def? statement) (eq? 'static-function (car statement))) ; Checks if a statement is defining a static function
+(define (new? statement) (eq? 'new (car statement))) ; Checks if a statement is creating a new class instance
 
 ; Adds a new layer to the front of the layers list
 (define new-layer
@@ -251,7 +252,15 @@
       ((boolean-expression? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (boolean (car output) k1 k2) s2)) throw)) throw))
       ((assignment? output) (return-value* (arg2 output) layers (lambda (k s) (set-variable* (arg1 output) k s (lambda (updated-layers) (cc k updated-layers)))) throw))
       ((function-call? output) (call-function (arg1 output) (cdr (cdr output)) layers (lambda (v s) (cc v s)) throw))
+      ((new? output) (instantiate-class (arg1 output) layers cc throw))
       (else (return-value* (car output) layers cc throw)))))
+
+; Creates a new instance of the specified class and returns an error if the class does not exist
+(define instantiate-class
+  (lambda (classname layers cc throw)
+    (if (var-exists*? classname layers)
+        (cc (create-instance-closure classname '()) layers)
+        (error (string-append "The class \"" (symbol->string classname) "\" does not exist!")))))
 
 ; Computes the values of the parameters inputted into a function call and binds them to the formal parameters in the function environment
 (define compute-params
@@ -362,9 +371,7 @@
 
 (define (var-exists? var-name variables) (if (assoc var-name variables) #t #f)) ; Checks if a variable with the inputted name exists within a given layer
 (define (var-exists*? var-name layers) (ormap (lambda (k) (var-exists? var-name k)) layers)) ; Checks if a variable with the inputted name exists in general
-(define (is-function? var-name layers) ; Checks if the "variable" with the inputted name is a function
-  (let ((val (get-variable* var-name layers)))
-    (and (not (null? val)) (list? val))))
+(define (is-function? var-name layers) (eq? (get-type (get-variable* var-name layers)) 'function)) ; Checks if the "variable" with the inputted name is a function
 
 ; Gets the type of the variable associated with the inputted value based on the value's structure
 (define (get-type var-value)
@@ -376,11 +383,11 @@
 ; Creates a 3-tuple of a function's formal parameters, body, and environment function to represent its closure
 (define create-closure
   (lambda (formal-params body env-func)
-    (list (cons formal-params (cons body env-func)))))
+    (list formal-params body env-func)))
 
-(define (params closure) (car (car closure))) ; Gets the formal parameters from a function's closure
-(define (func-body closure) (arg1 (car closure))) ; Gets the function body from a function's closure
-(define (env-function closure) (cdr (cdr (car closure)))) ; Gets the environment function from a function's closure
+(define (params closure) (car closure)) ; Gets the formal parameters from a function's closure
+(define (func-body closure) (cadr closure)) ; Gets the function body from a function's closure
+(define (env-function closure) (caddr closure)) ; Gets the environment function from a function's closure
 
 ; Adds a new variable with the inputted name and value if it doesn't already exist
 (define add-variable
