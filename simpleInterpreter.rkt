@@ -1,23 +1,46 @@
 #lang racket
 
-(require "functionParser.rkt")
+(require "classParser.rkt")
 (require racket/trace) ; Enables the use of the "trace" function (for debugging purposes)
 
 ; Interprets the code contained in the file with the inputted filename
 (define interpret*
-  (lambda (filename) (translate-booleans (call-main (interpret-raw-code* (parser filename) '() value-state (lambda (s) s) (lambda (v s) (error "Uncaught exception:" v)))))))
+  (lambda (filename classname)
+    (translate-booleans (call-main (interpret-raw-code* (parser filename) '() value-state values (lambda (v s) (error "Uncaught exception:" v))) classname))))
+
+; Assembles the closure for the specified class
+(define create-class-closure
+  (lambda (superclass instance-fields functions)
+    (cons superclass (cons instance-fields (list functions)))))
+
+; Assembles the closure for an instance of the specified class
+(define create-instance-closure
+  (lambda (class instance-field-vals)
+    (cons class (list instance-field-vals))))
+
+(define (class-functions class-closure) (arg2 class-closure)) ; Gets the list of functions from a class closure
+
+; Gets the name-closure binding of every function in the inputted class body
+(define get-class-functions
+  (lambda (class-body)
+    (filter
+      (lambda (k) (list? (value k)))
+      (car (interpret-raw-code* class-body '() value-state values (lambda (v s) (error "Uncaught exception:" v)))))))
 
 ; Replaces "#t" with "true" and "#f" with "false", but leaves the inputted value untouched otherwise
 (define translate-booleans
   (lambda (output)
     (if (boolean? output) (if (eq? output #t) 'true 'false) output)))
 
-; Calls the main() function and returns its output
+; Calls the main() function of the inputted class and returns its output
 (define call-main
-  (lambda (layers)
-    (if (and (var-exists*? 'main layers) (is-function? 'main layers))
-        (call-function 'main '() layers value-state (lambda (v s) (error "Uncaught exception:" v)))
-        (error "No main() function has been defined in the code!"))))
+  (lambda (classdefs classname)
+    (if (var-exists*? classname classdefs)
+        (let* ((class-contents (list (class-functions (car (get-variable* classname classdefs))))))
+          (if (var-exists*? 'main class-contents)
+            (call-function 'main '() class-contents value-state (lambda (v s) (error "Uncaught exception:" v)))
+            (error "No main() function has been defined in the code for class:" classname)))
+        (error (string-append "The class \"" (symbol->string classname) "\" does not exist!")))))
 
 ; Interprets the inputted pre-parsed code one statement at a time, or returns the value of the current statement if it is a "return" statement 
 (define interpret-raw-code*
@@ -48,8 +71,12 @@
 (define (break? statement) (eq? 'break (car statement))) ; Checks if the inputted statement is a "break" statement
 (define (try? statement) (eq? 'try (car statement))) ; Checks if a statement corresponds to a try-catch block
 (define (throw? statement) (eq? 'throw (car statement))) ; Checks if a statement is throwing a value/exception
+
 (define (function-def? statement) (eq? 'function (car statement))) ; Checks if a statement is defining a function
 (define (function-call? statement) (eq? 'funcall (car statement))) ; Checks if a statement is calling a function
+
+(define (class-def? statement) (eq? 'class (car statement))) ; Checks if a statement is defining a class
+(define (static-f-def? statement) (eq? 'static-function (car statement))) ; Checks if a statement is defining a static function
 
 ; Adds a new layer to the front of the layers list
 (define new-layer
@@ -103,6 +130,11 @@
   (lambda (statement layers next return continue break throw)
     (cond
       ((null? statement) (next layers))
+      ((class-def? statement) (add-variable*
+        (arg1 statement)
+        (list (create-class-closure null null (get-class-functions (arg3 statement))))
+        layers
+        next))
       ((block? statement) (execute-block (cdr statement) (new-layer layers) next return continue break throw))
       ((try? statement) (try-catch-block (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
       ((throw? statement) (return-value* (cdr statement) layers (lambda (k s) (throw k s)) throw))
@@ -115,6 +147,11 @@
       ((while-statement? statement) (while-statement* (arg1 statement) (arg2 statement) layers next return continue break throw))
       ((return? statement) (return-value* (cdr statement) layers (lambda (k s) (return k s)) throw))
       ((function-def? statement) (add-variable*
+        (arg1 statement)
+        (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement) layers))
+        layers
+        next))
+      ((static-f-def? statement) (add-variable*
         (arg1 statement)
         (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement) layers))
         layers
@@ -257,16 +294,7 @@
             throw))
         (error (string-append "The function \"" (symbol->string name) "()\" has not yet been defined!")))))
 
-; Removes bindings with uninitialized values (var declared but not assigned)
-(define remove-uninitialized
-  (lambda (layers)
-    (map (lambda (layer)
-           (filter (lambda (binding)
-                     (not (equal? (cdr binding) '())))
-                   layer))
-         layers)))
-
-; Removes param placeholder bindings created by bind-formal-params
+; Removes parameter placeholder bindings created by bind-formal-params
 (define remove-param-placeholders
   (lambda (layers)
     (map (lambda (layer)
@@ -336,7 +364,14 @@
 (define (var-exists*? var-name layers) (ormap (lambda (k) (var-exists? var-name k)) layers)) ; Checks if a variable with the inputted name exists in general
 (define (is-function? var-name layers) ; Checks if the "variable" with the inputted name is a function
   (let ((val (get-variable* var-name layers)))
-    (and (not (null? val)) (list? val)))) 
+    (and (not (null? val)) (list? val))))
+
+; Gets the type of the variable associated with the inputted value based on the value's structure
+(define (get-type var-value)
+  (match var-value
+    [(list _ _ _) 'function]
+    [(list class _) class]
+    [_ 'var]))
 
 ; Creates a 3-tuple of a function's formal parameters, body, and environment function to represent its closure
 (define create-closure
@@ -404,33 +439,26 @@
 
 ; Helper to run a single test safely
 (define run-test
-  (lambda (label filename)
+  (lambda (label filename classname)
     (begin
       (display label)
       (with-handlers ([exn? (lambda (e) (writeln (exn-message e)))])
-        (writeln (interpret* filename))))))
+        (writeln (interpret* filename classname))))))
 
-; Runs every test for Project 3 at once
+; Runs every test for Project 4 at once
 (define test-all
   (lambda ()
     (begin
-      (run-test "Test 1: " "test3-1.rkt")
-      (run-test "Test 2: " "test3-2.rkt")
-      (run-test "Test 3: " "test3-3.rkt")
-      (run-test "Test 4: " "test3-4.rkt")
-      (run-test "Test 5: " "test3-5.rkt")
-      (run-test "Test 6: " "test3-6.rkt")
-      (run-test "Test 7: " "test3-7.rkt")
-      (run-test "Test 8: " "test3-8.rkt")
-      (run-test "Test 9: " "test3-9.rkt")
-      (run-test "Test 10: " "test3-10.rkt")
-      (run-test "Test 11: " "test3-11.rkt")
-      (run-test "Test 12: " "test3-12.rkt")
-      (run-test "Test 13: " "test3-13.rkt")
-      (run-test "Test 14: " "test3-14.rkt")
-      (run-test "Test 15: " "test3-15.rkt")
-      (run-test "Test 16: " "test3-16.rkt")
-      (run-test "Test 17: " "test3-17.rkt")
-      (run-test "Test 18: " "test3-18.rkt")
-      (run-test "Test 19: " "test3-19.rkt")
-      (run-test "Test 20: " "test3-20.rkt"))))
+      (run-test "Test 1: " "test4-1.rkt" 'A)
+      (run-test "Test 2: " "test4-2.rkt" 'A)
+      (run-test "Test 3: " "test4-3.rkt" 'A)
+      (run-test "Test 4: " "test4-4.rkt" 'A)
+      (run-test "Test 5: " "test4-5.rkt" 'A)
+      (run-test "Test 6: " "test4-6.rkt" 'A)
+      (run-test "Test 7: " "test4-7.rkt" 'C)
+      (run-test "Test 8: " "test4-8.rkt" 'Square)
+      (run-test "Test 9: " "test4-9.rkt" 'Square)
+      (run-test "Test 10: " "test4-10.rkt" 'List)
+      (run-test "Test 11: " "test4-11.rkt" 'List)
+      (run-test "Test 12: " "test4-12.rkt" 'List)
+      (run-test "Test 13: " "test4-13.rkt" 'C))))
