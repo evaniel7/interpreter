@@ -27,6 +27,13 @@
       (lambda (k) (eq? (get-type (value k)) 'function))
       (car (interpret-raw-code* class-body '() value-state values (lambda (v s) (error "Uncaught exception:" v)))))))
 
+; Gets the name-value binding of every variable in the inputted class body
+(define get-class-fields
+  (lambda (class-body)
+    (filter
+      (lambda (k) (eq? (get-type (value k)) 'var))
+      (car (interpret-raw-code* class-body '() value-state values (lambda (v s) (error "Uncaught exception:" v)))))))
+
 ; Replaces "#t" with "true" and "#f" with "false", but leaves the inputted value untouched otherwise
 (define translate-booleans
   (lambda (output)
@@ -78,6 +85,7 @@
 (define (class-def? statement) (eq? 'class (car statement))) ; Checks if a statement is defining a class
 (define (static-f-def? statement) (eq? 'static-function (car statement))) ; Checks if a statement is defining a static function
 (define (new? statement) (eq? 'new (car statement))) ; Checks if a statement is creating a new class instance
+(define (dot-operator? statement) (eq? 'dot (car statement))) ; Checks if a statement is calling upon a class variable, function or inner class
 
 ; Adds a new layer to the front of the layers list
 (define new-layer
@@ -110,10 +118,7 @@
                                     acc))
                               '()
                               (append body-atoms (flatten outer-state)))))
-      (lambda (call-time-state)
-        (if (null? param-layer)
-            (list param-layer func-layer)
-            (list param-layer func-layer))))))
+      (lambda (call-time-state) (list param-layer func-layer)))))
 
 ; Helper function for getting only assigned variables from the function body
 (define get-assigned-vars
@@ -126,6 +131,17 @@
            '()
            body)))
 
+; Helper function that allows for statements of the form "this.[field name]" to be assigned a value
+(define dot-assign
+  (lambda (dot-expr new-val layers next)
+    (let* ((instance-name (arg1 dot-expr))
+           (field-name    (arg2 dot-expr))
+           (instance      (get-variable* instance-name layers))
+           (updated-instance (create-instance-closure
+                               (car instance)
+                               (set-variable field-name new-val (cadr instance)))))
+      (set-variable* instance-name updated-instance layers next))))
+
 ; Updates the program's variable layers by executing the inputted statement, or returning its associated value if it is a "return" statement
 (define interpret-statement*
   (lambda (statement layers next return continue break throw)
@@ -133,7 +149,7 @@
       ((null? statement) (next layers))
       ((class-def? statement) (add-variable*
         (arg1 statement)
-        (list (create-class-closure null null (get-class-functions (arg3 statement))))
+        (list (create-class-closure null (get-class-fields (arg3 statement)) (get-class-functions (arg3 statement))))
         layers
         next))
       ((block? statement) (execute-block (cdr statement) (new-layer layers) next return continue break throw))
@@ -143,7 +159,13 @@
       ((break? statement) (break layers))
       ((function-call? statement) (call-function (arg1 statement) (cdr (cdr statement)) layers (lambda (v s) (next s)) throw))
       ((declaration? statement) (return-value* (arg2 statement) layers (lambda (k s) (add-variable* (arg1 statement) k s next)) throw))
-      ((assignment? statement) (return-value* (arg2 statement) layers (lambda (k s) (set-variable* (arg1 statement) k s next)) throw))
+      ((assignment? statement) (return-value*
+        (arg2 statement)
+        layers
+        (lambda (k s) (if (pair? (arg1 statement))
+          (dot-assign (arg1 statement) k s next)
+          (set-variable* (arg1 statement) k s next)))
+        throw))
       ((if-statement? statement) (if-statement* (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
       ((while-statement? statement) (while-statement* (arg1 statement) (arg2 statement) layers next return continue break throw))
       ((return? statement) (return-value* (cdr statement) layers (lambda (k s) (return k s)) throw))
@@ -247,20 +269,52 @@
       ((eq? 'true output) (cc #t layers))
       ((eq? 'false output) (cc #f layers))
       ((atom? output) (cc (get-variable* output layers) layers))
-      ((math? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (do-math (car output) k1 k2) s2)) throw)) throw))
-      ((comparison? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (compare (car output) k1 k2) s2)) throw)) throw))
-      ((boolean-expression? output) (return-value* (arg1 output) layers (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (boolean (car output) k1 k2) s2)) throw)) throw))
-      ((assignment? output) (return-value* (arg2 output) layers (lambda (k s) (set-variable* (arg1 output) k s (lambda (updated-layers) (cc k updated-layers)))) throw))
+      ((math? output) (return-value*
+          (arg1 output)
+          layers
+          (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (do-math (car output) k1 k2) s2)) throw))
+          throw))
+      ((comparison? output) (return-value*
+          (arg1 output)
+          layers
+          (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (compare (car output) k1 k2) s2)) throw))
+          throw))
+      ((boolean-expression? output) (return-value*
+          (arg1 output)
+          layers
+          (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (boolean (car output) k1 k2) s2)) throw))
+          throw))
+      ((assignment? output) (return-value*
+          (arg2 output)
+          layers
+          (lambda (k s) (if (pair? (arg1 output))
+            (dot-assign (arg1 output) k s (lambda (updated-layers) (cc k updated-layers)))
+            (set-variable* (arg1 output) k s (lambda (updated-layers) (cc k updated-layers)))))
+          throw))
       ((function-call? output) (call-function (arg1 output) (cdr (cdr output)) layers (lambda (v s) (cc v s)) throw))
       ((new? output) (instantiate-class (arg1 output) layers cc throw))
+      ((dot-operator? output) (access-class-field (arg1 output) (arg2 output) layers cc throw))
       (else (return-value* (car output) layers cc throw)))))
 
 ; Creates a new instance of the specified class and returns an error if the class does not exist
 (define instantiate-class
   (lambda (classname layers cc throw)
     (if (var-exists*? classname layers)
-        (cc (create-instance-closure classname '()) layers)
+        (cc (create-instance-closure classname (cadr (car (get-variable* classname layers)))) layers)
         (error (string-append "The class \"" (symbol->string classname) "\" does not exist!")))))
+
+; Gets the value of a class instance field that is being accessed via the dot operator
+(define access-class-field
+  (lambda (instance-expression fieldname layers cc throw)
+    (return-value*
+      instance-expression
+      layers
+      (lambda (instance post-eval-layers)
+        (let* ((field-vals (cadr instance)))
+          (if (var-exists*? fieldname (list field-vals))
+            (cc (get-variable fieldname field-vals) post-eval-layers)
+            (error (string-append "Field \"" (symbol->string fieldname) "\" does not exist in this class instance!")))))
+      throw)))
 
 ; Computes the values of the parameters inputted into a function call and binds them to the formal parameters in the function environment
 (define compute-params
@@ -283,10 +337,32 @@
 ; Calls the function with the specified name and evaluates it with the specified values for its parameters
 (define call-function
   (lambda (name inputs layers cc throw)
-    (if (and (var-exists*? name layers) (is-function? name layers))
-        (let* ((closure (get-variable* name layers))
-               (func-env ((env-function closure) layers))
-               (env (cons '() (append func-env layers))))
+    (if (pair? name) ; Detects dot operator-based function call (currently the only case where the name is a list)
+      (return-value*
+         (arg1 name)
+         layers  
+         (lambda (instance post-eval-layers)
+           (let* ((class-closure (car (get-variable* (car instance) post-eval-layers)))
+                  (method-layer (cons (new-variable 'this instance)
+                  (class-functions class-closure))))
+           (call-function
+             (arg2 name)
+             inputs
+             (cons method-layer post-eval-layers)
+             (lambda (v post-layers)
+               (if (symbol? (arg1 name)) ; Only write back if instance was a named variable
+                 (set-variable*
+                   (arg1 name)
+                   (get-variable* 'this post-layers)
+                   (propagate-mutations post-eval-layers post-layers)
+                   (lambda (final-layers) (cc v final-layers)))
+                 (cc v (propagate-mutations post-eval-layers post-layers))))
+             throw)))
+         throw)
+      (if (and (var-exists*? name layers) (is-function? name layers))
+          (let* ((closure (get-variable* name layers))
+                 (func-env ((env-function closure) layers))
+                 (env (cons '() (append func-env layers))))
           (compute-params
             (params closure)
             inputs
@@ -301,7 +377,7 @@
                 (lambda (v s)
                   (throw v (propagate-mutations layers s)))))
             throw))
-        (error (string-append "The function \"" (symbol->string name) "()\" has not yet been defined!")))))
+        (error (string-append "The function \"" (symbol->string name) "()\" has not yet been defined!"))))))
 
 ; Removes parameter placeholder bindings created by bind-formal-params
 (define remove-param-placeholders
