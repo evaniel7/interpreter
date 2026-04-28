@@ -18,15 +18,20 @@
   (lambda (class instance-field-vals)
     (cons class (list instance-field-vals))))
 
-(define (class-functions class-closure) (arg2 class-closure)) ; Gets the list of functions from a class closure
+(define (class-super class-closure) (car class-closure))
+(define (class-fields class-closure) (cadr class-closure))
+(define (class-functions class-closure) (caddr class-closure))
 
 ; Gets the name-closure binding of every function in the inputted class body
 (define get-class-functions
   (lambda (class-body)
     (filter
-      (lambda (k) (eq? (get-type (value k)) 'function))
-      (car (interpret-raw-code* class-body '() value-state values (lambda (v s) (error "Uncaught exception:" v)))))))
-
+      (lambda (k)
+        (match (value k)
+          [(list _ _ _) #t]
+          [_ #f]))
+      (car (interpret-raw-code* class-body '() value-state values
+                                (lambda (v s) (error "Uncaught exception:" v)))))))
 ; Gets the name-value binding of every variable in the inputted class body
 (define get-class-fields
   (lambda (class-body)
@@ -147,11 +152,20 @@
   (lambda (statement layers next return continue break throw)
     (cond
       ((null? statement) (next layers))
-      ((class-def? statement) (add-variable*
-        (arg1 statement)
-        (list (create-class-closure null (get-class-fields (arg3 statement)) (get-class-functions (arg3 statement))))
-        layers
-        next))
+      ((class-def? statement)
+       (let* ([class-name (arg1 statement)]
+        [parent-name (if (null? (arg2 statement))
+                         null
+                         (arg1 (arg2 statement)))]
+        [class-closure
+         (create-class-closure
+          parent-name
+          (get-class-fields (arg3 statement))
+          (get-class-functions (arg3 statement)))])
+         (add-variable* class-name
+                  (list class-closure)
+                  layers
+                  next)))
       ((block? statement) (execute-block (cdr statement) (new-layer layers) next return continue break throw))
       ((try? statement) (try-catch-block (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
       ((throw? statement) (return-value* (cdr statement) layers (lambda (k s) (throw k s)) throw))
@@ -268,6 +282,7 @@
       ((boolean? output) (cc output layers))
       ((eq? 'true output) (cc #t layers))
       ((eq? 'false output) (cc #f layers))
+      ((eq? output 'super) (cc (get-variable* 'this layers) layers))
       ((atom? output) (cc (get-variable* output layers) layers))
       ((math? output) (return-value*
           (arg1 output)
@@ -485,40 +500,60 @@
 (define (name binding) (car binding)) ; Gets the "name" part of a name-value binding
 
 ; Gets the value bound to a variable with the inputted name, if it exists
-(define get-variable-cps
-  (lambda (var-name variables return)
-    (cond
-      ((empty? variables) (error (string-append "The variable \"" (symbol->string var-name) "\" does not exist! Make sure it has been declared first!")))
-      ((eq? (name (car variables)) var-name) (return (value (car variables))))
-      (else (get-variable-cps var-name (cdr variables) return)))))
-(define get-variable
-  (lambda (var-name variables) (get-variable-cps var-name variables values)))
-
-; New version of get-variable that works with the layers implementation of the program state
 (define get-variable*
   (lambda (var-name layers)
-    (cond
-      ((empty? layers) (error (string-append "The variable \"" (symbol->string var-name) "\" does not exist! Make sure it has been declared first!")))
-      ((var-exists? var-name (car layers)) (get-variable var-name (car layers)))
-      (else (get-variable* var-name (cdr layers))))))    
+    (letrec ([lookup
+              (lambda (ls)
+                (cond
+                  [(empty? ls)
+                   (if (and (not (eq? var-name 'this))
+                            (var-exists*? 'this layers)
+                            (var-exists? var-name (cadr (get-variable* 'this layers))))
+                       (get-variable var-name (cadr (get-variable* 'this layers)))
+                       (error (string-append "The variable \""
+                                             (symbol->string var-name)
+                                             "\" does not exist! Make sure it has been declared first!")))]
+                  [(var-exists? var-name (car ls))
+                   (get-variable var-name (car ls))]
+                  [else (lookup (cdr ls))]))])
+      (lookup layers))))
+(define get-variable
+  (lambda (var-name variables)
+    (get-variable* var-name (list variables))))
 
 ; Takes the name of an existing variable and its new value and creates a new binding between them to replace the current one
-(define set-variable-cps
-  (lambda (var-name val variables return)
-    (cond
-      ((empty? variables) (error (string-append "The variable \"" (symbol->string var-name) "\" must be declared before it can be assigned a value!")))
-      ((eq? (name (car variables)) var-name) (return (add-variable var-name val (cdr variables))))
-      (else (set-variable-cps var-name val (cdr variables) (lambda (k) (return (cons (car variables) k))))))))
-(define set-variable
-  (lambda (var-name val variables) (set-variable-cps var-name val variables values)))
-
-; New version of set-variable that works with the layers implementation of the program state
 (define set-variable*
   (lambda (var-name val layers next)
-    (cond
-      ((empty? layers) (error (string-append "The variable \"" (symbol->string var-name) "\" must be declared before it can be assigned a value!")))
-      ((var-exists? var-name (car layers)) (next (cons (set-variable var-name val (car layers)) (cdr layers))))
-      (else (set-variable* var-name val (cdr layers) (lambda (k) (next (cons (car layers) k))))))))
+    (letrec ([update-this-field
+              (lambda ()
+                (let* ([this-obj (get-variable* 'this layers)]
+                       [updated-this
+                        (create-instance-closure
+                         (car this-obj)
+                         (set-variable var-name val (cadr this-obj)))])
+                  (set-variable* 'this updated-this layers next)))]
+             [set-helper
+              (lambda (ls rebuild)
+                (cond
+                  [(empty? ls)
+                   (if (and (var-exists*? 'this layers)
+                            (var-exists? var-name (cadr (get-variable* 'this layers))))
+                       (update-this-field)
+                       (error (string-append "The variable \""
+                                             (symbol->string var-name)
+                                             "\" must be declared before it can be assigned a value!")))]
+                  [(var-exists? var-name (car ls))
+                   (next (rebuild
+                          (cons (set-variable var-name val (car ls))
+                                (cdr ls))))]
+                  [else
+                   (set-helper
+                    (cdr ls)
+                    (lambda (rest) (rebuild (cons (car ls) rest))))]))])
+      (set-helper layers values))))
+(define set-variable
+  (lambda (var-name val variables)
+    (car (set-variable* var-name val (list variables) values))))
 
 ; Helper to run a single test safely
 (define run-test
@@ -527,21 +562,3 @@
       (display label)
       (with-handlers ([exn? (lambda (e) (writeln (exn-message e)))])
         (writeln (interpret* filename classname))))))
-
-; Runs every test for Project 4 at once
-(define test-all
-  (lambda ()
-    (begin
-      (run-test "Test 1: " "test4-1.rkt" 'A)
-      (run-test "Test 2: " "test4-2.rkt" 'A)
-      (run-test "Test 3: " "test4-3.rkt" 'A)
-      (run-test "Test 4: " "test4-4.rkt" 'A)
-      (run-test "Test 5: " "test4-5.rkt" 'A)
-      (run-test "Test 6: " "test4-6.rkt" 'A)
-      (run-test "Test 7: " "test4-7.rkt" 'C)
-      (run-test "Test 8: " "test4-8.rkt" 'Square)
-      (run-test "Test 9: " "test4-9.rkt" 'Square)
-      (run-test "Test 10: " "test4-10.rkt" 'List)
-      (run-test "Test 11: " "test4-11.rkt" 'List)
-      (run-test "Test 12: " "test4-12.rkt" 'List)
-      (run-test "Test 13: " "test4-13.rkt" 'C))))
