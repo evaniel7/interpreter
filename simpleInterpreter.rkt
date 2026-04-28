@@ -139,9 +139,6 @@
     (let* ((instance-name (arg1 dot-expr))
            (field-name    (arg2 dot-expr))
            (instance      (get-variable* instance-name layers)))
-      ; We pass the instance's fields to set-variable-cps.
-      ; Once the box is mutated, we ignore the returned list and 
-      ; just advance the program state by calling (next layers).
       (set-variable-cps field-name 
                         new-val 
                         (cadr instance) 
@@ -198,8 +195,7 @@
                (parent-name    (car class-closure))
                (own-fields     (cadr class-closure))
                (parent-fields  (get-inherited-fields parent-name layers)))
-          ; By using append here without foldl, we keep shadowed fields.
-          (append own-fields parent-fields)))))
+            (append own-fields parent-fields)))))
 
 ; Collects all methods from the full class hierarchy. Own methods take priority
 (define get-all-methods
@@ -336,9 +332,9 @@
 (define instantiate-class
   (lambda (classname layers cc throw)
     (if (var-exists*? classname layers)
-        (let ((fresh-fields (map (lambda (f) (new-variable (name f) (value f))) (get-inherited-fields classname layers))))
-          (cc (create-instance-closure classname fresh-fields) layers))
-        (error (string-append "The class \"" (symbol->string classname) "\" does not exist!")))))
+      (let ((fresh-fields (map (lambda (f) (new-variable (name f) (value f))) (get-inherited-fields classname layers))))
+        (cc (create-instance-closure classname fresh-fields) layers))
+      (error (string-append "The class \"" (symbol->string classname) "\" does not exist!")))))
 
 ; Gets the value of a class instance field that is being accessed via the dot operator
 (define access-class-field
@@ -348,9 +344,9 @@
       layers
       (lambda (instance post-eval-layers)
         (let* ((field-vals (cadr instance)))
-          (if (var-exists*? fieldname (list field-vals))
-            (cc (get-variable fieldname field-vals) post-eval-layers)
-            (error (string-append "Field \"" (symbol->string fieldname) "\" does not exist in this class instance!")))))
+            (if (var-exists*? fieldname (list field-vals))
+              (cc (get-variable fieldname field-vals) post-eval-layers)
+              (error (string-append "Field \"" (symbol->string fieldname) "\" does not exist in this class instance!")))))
       throw)))
 
 ; Computes the values of the parameters inputted into a function call and binds them to the formal parameters in the function environment
@@ -407,8 +403,6 @@
            (scoped-fields   (list-tail (cadr instance) (- all-field-count def-field-count)))
            (runtime-methods  (get-all-methods runtime-class layers))
            (def-methods      (get-all-methods defining-class layers))
-       ; Use runtime methods for virtual dispatch, but ensure 'name' resolves
-       ; to the defining-class version by putting def-methods entry for 'name' first
            (method-list      (cons (assoc name def-methods)
                                (filter (lambda (b) (not (eq? (car b) name)))
                                        runtime-methods)))
@@ -425,6 +419,7 @@
       (let* ((runtime-class   (car instance))
              (method-info     (find-method-in-chain name runtime-class post-eval-layers))
              (defining-class  (car method-info))
+             (closure         (value (cdr method-info)))
              (all-field-count (length (get-inherited-fields runtime-class post-eval-layers)))
              (def-field-count (length (get-inherited-fields defining-class post-eval-layers)))
              (field-offset    (- all-field-count def-field-count))
@@ -432,19 +427,37 @@
              (method-layer    (cons (new-variable 'this instance)
                                (cons (new-variable '%context defining-class)
                                      (get-all-methods runtime-class post-eval-layers))))
-             (field-layer     scoped-fields))
-        (call-function name inputs (cons field-layer (cons method-layer post-eval-layers))
-          (lambda (return-val post-method-layers)
-            (let* ((post-method-layer (car post-method-layers))
-                   (updated-fields    (append (take (cadr instance) field-offset)
-                           scoped-fields
-                           (list-tail (cadr instance) all-field-count)))
-                   (updated-instance  (create-instance-closure runtime-class updated-fields)))
-              (if (atom? instance-expr)
-                  (set-variable* instance-expr updated-instance
-                                 (propagate-mutations post-eval-layers post-method-layers)
-                                 (lambda (s) (cc return-val s)))
-                  (cc return-val (propagate-mutations post-eval-layers post-method-layers)))))
+             (field-layer     scoped-fields)
+             (call-env        (cons (bind-formal-params (params closure))
+                               (cons field-layer
+                                 (cons method-layer post-eval-layers)))))
+        (compute-params
+          (params closure)
+          inputs
+          post-eval-layers
+          call-env
+          (lambda (env)
+            (interpret-raw-code*
+              (func-body closure)
+              (remove-param-placeholders env)
+              (lambda (return-val post-method-layers)
+                (let* ((post-field-layer  (cadr post-method-layers))
+                       (updated-fields    (append (take (cadr instance) field-offset)
+                                                  post-field-layer
+                                                  (list-tail (cadr instance) all-field-count)))
+                       (updated-instance  (create-instance-closure runtime-class updated-fields))
+                       (propagated        (propagate-mutations post-eval-layers post-method-layers)))
+                  (cond
+                    ((atom? instance-expr)
+                     (set-variable* instance-expr updated-instance propagated
+                                    (lambda (s) (cc return-val s))))
+                    ((dot-operator? instance-expr)
+                     (dot-assign instance-expr updated-instance propagated
+                                 (lambda (s) (cc return-val s))))
+                    (else
+                     (cc return-val propagated)))))
+              (lambda (s) (cc null (propagate-mutations post-eval-layers s)))
+              (lambda (v s) (throw v (propagate-mutations post-eval-layers s)))))
           throw)))
     throw)))
 
