@@ -105,7 +105,7 @@
 (define construct-environment
   (lambda (formal-params body outer-state)
     (let* ((body-atoms (flatten body))
-           (written-vars (get-assigned-vars body)) ; variables assigned anywhere in body
+           (written-vars (get-assigned-vars body))
            (param-layer (bind-formal-params formal-params))
            (func-layer (foldl (lambda (k acc)
                                 (if (and (atom? k)
@@ -113,14 +113,14 @@
                                          (not (var-exists? k acc))
                                          (var-exists*? k outer-state)
                                          (not (null? (get-variable* k outer-state)))
-                                         (or (is-function? k outer-state)
-                                             (and (member k body-atoms)
-                                                  (not (member k written-vars))))) ; read-only
+                                         (and (member k body-atoms)
+                                              (not (member k written-vars))
+                                              (not (is-function? k outer-state))))
                                     (cons (new-variable k (get-variable* k outer-state)) acc)
                                     acc))
                               '()
                               (append body-atoms (flatten outer-state)))))
-      (lambda (call-time-state) (list param-layer func-layer)))))
+      (lambda (call-time-state) (append (list param-layer func-layer) call-time-state)))))
 
 ; Helper function for getting only assigned variables from the function body
 (define get-assigned-vars
@@ -379,7 +379,7 @@
       (if (and (var-exists*? name layers) (is-function? name layers))
         (let* ((closure  (get-variable* name layers))
                (func-env ((env-function closure) layers))
-               (env      (cons '() (append func-env layers))))
+               (env      (cons '() func-env)))
           (compute-params
             (params closure)
             inputs
@@ -418,7 +418,7 @@
                                        method-list)))))
       (call-function name inputs (cons method-layer layers) cc throw))))
 
-; Handles dot operator-based function calls of the form "this.[function]" (i.e. class function calls)
+; Handles function calls of the form "this.[function]" (i.e. class function calls)
 (define call-this-function
   (lambda (instance-expr name inputs layers cc throw)
     (return-value* instance-expr layers (lambda (instance post-eval-layers)
@@ -429,19 +429,17 @@
              (def-field-count (length (get-inherited-fields defining-class post-eval-layers)))
              (field-offset    (- all-field-count def-field-count))
              (scoped-fields   (list-tail (cadr instance) field-offset))
-             (method-layer    (append scoped-fields
-                                      (cons (new-variable 'this instance)
-                                      (cons (new-variable '%context defining-class)
-                                            (get-all-methods runtime-class post-eval-layers))))))
-        (call-function name inputs (cons method-layer post-eval-layers)
+             (method-layer    (cons (new-variable 'this instance)
+                               (cons (new-variable '%context defining-class)
+                                     (get-all-methods runtime-class post-eval-layers))))
+             (field-layer     scoped-fields))
+        (call-function name inputs (cons field-layer (cons method-layer post-eval-layers))
           (lambda (return-val post-method-layers)
-            ; Write scoped fields back into the instance
             (let* ((post-method-layer (car post-method-layers))
                    (updated-fields    (append (take (cadr instance) field-offset)
                            scoped-fields
                            (list-tail (cadr instance) all-field-count)))
                    (updated-instance  (create-instance-closure runtime-class updated-fields)))
-              ; Mutate the instance in place in the layers that existed before the call
               (if (atom? instance-expr)
                   (set-variable* instance-expr updated-instance
                                  (propagate-mutations post-eval-layers post-method-layers)
@@ -466,7 +464,11 @@
            (match         (assoc name methods)))
       (cond
         (match (cons classname match)) ; Found it!
-        ((null? parent) (error "Method not found:" name))
+        ((null? parent)
+         (let ((fallback (assoc name (get-all-methods (car (get-variable* 'this layers)) layers))))
+           (if fallback
+               (cons (car (get-variable* 'this layers)) fallback)
+               (error "Method not found:" name))))
         (else (find-method-in-chain name parent layers))))))
 
 ; Removes parameter placeholder bindings created by bind-formal-params
