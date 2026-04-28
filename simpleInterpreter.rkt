@@ -20,19 +20,15 @@
 
 (define (class-functions class-closure) (arg2 class-closure)) ; Gets the list of functions from a class closure
 
-; Gets the name-closure binding of every function in the inputted class body
-(define get-class-functions
-  (lambda (class-body)
+; Extracts bindings of the specified type (i.e. var or function) from the inputted class body
+(define get-class-members-of-type
+  (lambda (type class-body)
     (filter
-      (lambda (k) (eq? (get-type (value k)) 'function))
+      (lambda (k) (eq? (get-type (value k)) type))
       (car (interpret-raw-code* class-body '() value-state values (lambda (v s) (error "Uncaught exception:" v)))))))
 
-; Gets the name-value binding of every variable in the inputted class body
-(define get-class-fields
-  (lambda (class-body)
-    (filter
-      (lambda (k) (eq? (get-type (value k)) 'var))
-      (car (interpret-raw-code* class-body '() value-state values (lambda (v s) (error "Uncaught exception:" v)))))))
+(define (get-class-fields class-body)    (get-class-members-of-type 'var      class-body)) ; Gets the name-value binding of every variable in the inputted class body
+(define (get-class-functions class-body) (get-class-members-of-type 'function class-body)) ; Gets the name-closure binding of every function in the inputted class body
 
 ; Replaces "#t" with "true" and "#f" with "false", but leaves the inputted value untouched otherwise
 (define translate-booleans
@@ -86,7 +82,6 @@
 (define (static-f-def? statement) (eq? 'static-function (car statement))) ; Checks if a statement is defining a static function
 (define (new? statement) (eq? 'new (car statement))) ; Checks if a statement is creating a new class instance
 (define (dot-operator? statement) (eq? 'dot (car statement))) ; Checks if a statement is calling upon a class variable, function or inner class
-(define (subclass? statement) (eq? 'extends (car statement))) ; Checks if a statement is designating a class definition as extending a parent class
 
 ; Adds a new layer to the front of the layers list
 (define new-layer
@@ -108,7 +103,7 @@
            (written-vars (get-assigned-vars body))
            (param-layer (bind-formal-params formal-params))
            (func-layer (foldl (lambda (k acc)
-                                (if (and (atom? k)
+           (if (and (atom? k)
                                          (not (member k formal-params))
                                          (not (var-exists? k acc))
                                          (var-exists*? k outer-state)
@@ -184,7 +179,7 @@
         (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement) layers))
         layers
         next))
-      (else (error "The following statement count not be parsed: " statement)))))
+      (else (error "The following statement could not be parsed: " statement)))))
 
 ; Collects ALL instance fields. Child fields are at the front, Parent fields at the back.
 (define get-inherited-fields
@@ -236,7 +231,7 @@
       (lambda (k) (run-finally finally k next return continue break throw))
       return
       continue
-      break
+      (lambda (brk-s) (run-finally finally brk-s (lambda (fs) (break fs)) return continue break throw))
       (if (null? catch)
         throw
         (catch-throw catch finally layers next return continue break throw)))))
@@ -257,10 +252,10 @@
           (arg2 catch)
           catch-env
           (lambda (k) (run-finally finally k next return continue break throw))
-          return
+          (lambda (ret-val ret-s) (run-finally finally ret-s (lambda (fs) (return ret-val fs)) return continue break throw))
           continue
           break
-          throw))))))
+          (lambda (thr-val thr-s) (run-finally finally thr-s (lambda (fs) (throw thr-val fs)) return continue break throw))))))))
 
 ; Executes the inputted "if" statement and updates the program's variable layers accordingly
 (define if-statement*
@@ -346,7 +341,10 @@
         (let* ((field-vals (cadr instance)))
             (if (var-exists*? fieldname (list field-vals))
               (cc (get-variable fieldname field-vals) post-eval-layers)
-              (error (string-append "Field \"" (symbol->string fieldname) "\" does not exist in this class instance!")))))
+              (error (string-append
+                      "The field \"" (symbol->string fieldname)
+                      "\" does not exist in the instance \"" (symbol->string instance-expression)
+                      "\" of class " (symbol->string (get-type (get-variable* instance-expression layers))) "!")))))
       throw)))
 
 ; Computes the values of the parameters inputted into a function call and binds them to the formal parameters in the function environment
@@ -427,9 +425,8 @@
              (method-layer    (cons (new-variable 'this instance)
                                (cons (new-variable '%context defining-class)
                                      (get-all-methods runtime-class post-eval-layers))))
-             (field-layer     scoped-fields)
              (call-env        (cons (bind-formal-params (params closure))
-                               (cons field-layer
+                               (cons scoped-fields
                                  (cons method-layer post-eval-layers)))))
         (compute-params
           (params closure)
@@ -440,26 +437,55 @@
             (interpret-raw-code*
               (func-body closure)
               (remove-param-placeholders env)
-              (lambda (return-val post-method-layers)
-                (let* ((post-field-layer  (cadr post-method-layers))
-                       (updated-fields    (append (take (cadr instance) field-offset)
-                                                  post-field-layer
-                                                  (list-tail (cadr instance) all-field-count)))
-                       (updated-instance  (create-instance-closure runtime-class updated-fields))
-                       (propagated        (propagate-mutations post-eval-layers post-method-layers)))
-                  (cond
-                    ((atom? instance-expr)
-                     (set-variable* instance-expr updated-instance propagated
-                                    (lambda (s) (cc return-val s))))
-                    ((dot-operator? instance-expr)
-                     (dot-assign instance-expr updated-instance propagated
-                                 (lambda (s) (cc return-val s))))
-                    (else
-                     (cc return-val propagated)))))
+              (lambda (return-val post-method-layers) (update-instance-and-return
+                  return-val
+                  post-method-layers
+                  instance
+                  instance-expr
+                  scoped-fields
+                  field-offset
+                  all-field-count
+                  runtime-class
+                  post-eval-layers
+                  cc))
               (lambda (s) (cc null (propagate-mutations post-eval-layers s)))
-              (lambda (v s) (throw v (propagate-mutations post-eval-layers s)))))
+              (lambda (v s)
+                (update-instance-and-throw v s instance instance-expr scoped-fields runtime-class post-eval-layers throw))))
           throw)))
     throw)))
+
+; Helper function that ensures the proper updating of instance fields when a method returns normally
+(define update-instance-and-return
+  (lambda (return-val post-method-layers instance instance-expr scoped-fields field-offset all-field-count runtime-class post-eval-layers cc)
+    (let* ((updated-fields   (append (take (cadr instance) field-offset)
+                                     scoped-fields
+                                     (list-tail (cadr instance) all-field-count)))
+           (updated-instance (create-instance-closure runtime-class updated-fields))
+           (propagated       (propagate-mutations post-eval-layers post-method-layers)))
+      (cond
+        ((atom? instance-expr)
+         (set-variable* instance-expr updated-instance propagated
+                        (lambda (s) (cc return-val s))))
+        ((dot-operator? instance-expr)
+         (dot-assign instance-expr updated-instance propagated
+                     (lambda (s) (cc return-val s))))
+        (else
+         (cc return-val propagated))))))
+
+; Helper function for call-this-function that ensures the proper updating of instance fields when an exception is thrown
+(define update-instance-and-throw
+  (lambda (v s instance instance-expr scoped-fields runtime-class post-eval-layers throw)
+    (let* ((updated-instance  (create-instance-closure runtime-class scoped-fields))
+           (propagated        (propagate-mutations post-eval-layers s)))
+      (cond
+        ((atom? instance-expr)
+         (set-variable* instance-expr updated-instance propagated
+                        (lambda (s2) (throw v s2))))
+        ((dot-operator? instance-expr)
+         (dot-assign instance-expr updated-instance propagated
+                     (lambda (s2) (throw v s2))))
+        (else
+         (throw v propagated))))))
 
 ; Handles function calls that are performed via the dot operator
 (define call-dot-function
@@ -473,10 +499,10 @@
   (lambda (name classname layers)
     (let* ((class-closure (car (get-variable* classname layers)))
            (parent        (car class-closure))
-           (methods       (caddr class-closure)) ; caddr is the list of function bindings
+           (methods       (caddr class-closure)) 
            (match         (assoc name methods)))
       (cond
-        (match (cons classname match)) ; Found it!
+        (match (cons classname match)) 
         ((null? parent)
          (let ((fallback (assoc name (get-all-methods (car (get-variable* 'this layers)) layers))))
            (if fallback
@@ -577,7 +603,7 @@
       ((var-exists? var-name variables) (error (string-append "The variable \"" (symbol->string var-name) "\" already exists!")))
       (else (cons (new-variable var-name value) variables)))))
 
-; New version of add-varaible that works with the layers implementation of the program state
+; New version of add-variable that works with the layers implementation of the program state
 (define add-variable*
   (lambda (var-name value layers next)
     (cond
@@ -618,7 +644,7 @@
       ((eq? (name (car variables)) var-name)
        (begin
          (set-box! (cdr (car variables)) val)
-         (return variables))) ; Return the locally mutated list
+         (return variables))) 
       (else (set-variable-cps var-name val (cdr variables) (lambda (k) (return (cons (car variables) k))))))))
 
 ; New version of set-variable that works with the layers implementation of the program state
@@ -627,16 +653,9 @@
     (cond
       ((empty? layers) 
        (error (string-append "The variable \"" (symbol->string var-name) "\" must be declared before it can be assigned a value!")))
-      
-      ; Look for the variable in the current top layer
       ((var-exists? var-name (car layers))
-       (begin
-         ; Use set-box! to mutate the value in place. 
-         ; (cdr (car ...)) gets the box from the binding (name . box)
          (set-box! (cdr (get-binding var-name (car layers))) val)
-         (next layers)))
-      
-      ; If not in this layer, recurse to the next layer
+         (next layers))
       (else 
        (set-variable* var-name val (cdr layers) 
                       (lambda (updated-layers) 
@@ -651,15 +670,13 @@
 ; Helper to run a single test safely
 (define run-test
   (lambda (label filename classname)
-    (begin
-      (display label)
+    (display label)
       (with-handlers ([exn? (lambda (e) (writeln (exn-message e)))])
-        (writeln (interpret* filename classname))))))
+        (writeln (interpret* filename classname)))))
 
 ; Runs every test for Project 4 at once
 (define test-all
   (lambda ()
-    (begin
       (run-test "Test 1: " "test4-1.rkt" 'A)
       (run-test "Test 2: " "test4-2.rkt" 'A)
       (run-test "Test 3: " "test4-3.rkt" 'A)
@@ -672,4 +689,4 @@
       (run-test "Test 10: " "test4-10.rkt" 'List)
       (run-test "Test 11: " "test4-11.rkt" 'List)
       (run-test "Test 12: " "test4-12.rkt" 'List)
-      (run-test "Test 13: " "test4-13.rkt" 'C))))
+      (run-test "Test 13: " "test4-13.rkt" 'C)))
