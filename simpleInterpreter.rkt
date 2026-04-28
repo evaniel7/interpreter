@@ -86,6 +86,7 @@
 (define (static-f-def? statement) (eq? 'static-function (car statement))) ; Checks if a statement is defining a static function
 (define (new? statement) (eq? 'new (car statement))) ; Checks if a statement is creating a new class instance
 (define (dot-operator? statement) (eq? 'dot (car statement))) ; Checks if a statement is calling upon a class variable, function or inner class
+(define (subclass? statement) (eq? 'extends (car statement))) ; Checks if a statement is designating a class definition as extending a parent class
 
 ; Adds a new layer to the front of the layers list
 (define new-layer
@@ -111,6 +112,7 @@
                                          (not (member k formal-params))
                                          (not (var-exists? k acc))
                                          (var-exists*? k outer-state)
+                                         (not (null? (get-variable* k outer-state)))
                                          (or (is-function? k outer-state)
                                              (and (member k body-atoms)
                                                   (not (member k written-vars))))) ; read-only
@@ -136,11 +138,14 @@
   (lambda (dot-expr new-val layers next)
     (let* ((instance-name (arg1 dot-expr))
            (field-name    (arg2 dot-expr))
-           (instance      (get-variable* instance-name layers))
-           (updated-instance (create-instance-closure
-                               (car instance)
-                               (set-variable field-name new-val (cadr instance)))))
-      (set-variable* instance-name updated-instance layers next))))
+           (instance      (get-variable* instance-name layers)))
+      ; We pass the instance's fields to set-variable-cps.
+      ; Once the box is mutated, we ignore the returned list and 
+      ; just advance the program state by calling (next layers).
+      (set-variable-cps field-name 
+                        new-val 
+                        (cadr instance) 
+                        (lambda (_) (next layers))))))
 
 ; Updates the program's variable layers by executing the inputted statement, or returning its associated value if it is a "return" statement
 (define interpret-statement*
@@ -149,7 +154,10 @@
       ((null? statement) (next layers))
       ((class-def? statement) (add-variable*
         (arg1 statement)
-        (list (create-class-closure null (get-class-fields (arg3 statement)) (get-class-functions (arg3 statement))))
+        (list (create-class-closure
+               (if (empty? (arg2 statement)) null (arg1 (arg2 statement)))
+               (get-class-fields (arg3 statement))
+               (get-class-functions (arg3 statement))))
         layers
         next))
       ((block? statement) (execute-block (cdr statement) (new-layer layers) next return continue break throw))
@@ -180,6 +188,34 @@
         layers
         next))
       (else (error "The following statement count not be parsed: " statement)))))
+
+; Collects ALL instance fields. Child fields are at the front, Parent fields at the back.
+(define get-inherited-fields
+  (lambda (classname layers)
+    (if (null? classname)
+        '()
+        (let* ((class-closure  (car (get-variable* classname layers)))
+               (parent-name    (car class-closure))
+               (own-fields     (cadr class-closure))
+               (parent-fields  (get-inherited-fields parent-name layers)))
+          ; By using append here without foldl, we keep shadowed fields.
+          (append own-fields parent-fields)))))
+
+; Collects all methods from the full class hierarchy. Own methods take priority
+(define get-all-methods
+  (lambda (classname layers)
+    (if (null? classname)
+        '()
+        (let* ((class-closure   (car (get-variable* classname layers)))
+               (parent-name     (car class-closure))
+               (own-methods     (class-functions class-closure))
+               (parent-methods  (get-all-methods parent-name layers)))
+          (foldl (lambda (binding acc)
+                   (if (var-exists? (name binding) acc)
+                       acc
+                       (append acc (list binding))))
+                 own-methods
+                 parent-methods)))))
 
 ; Handles execution of code blocks, automatically removing the block's variable layer once execution is finished
 (define execute-block
@@ -300,7 +336,8 @@
 (define instantiate-class
   (lambda (classname layers cc throw)
     (if (var-exists*? classname layers)
-        (cc (create-instance-closure classname (cadr (car (get-variable* classname layers)))) layers)
+        (let ((fresh-fields (map (lambda (f) (new-variable (name f) (value f))) (get-inherited-fields classname layers))))
+          (cc (create-instance-closure classname fresh-fields) layers))
         (error (string-append "The class \"" (symbol->string classname) "\" does not exist!")))))
 
 ; Gets the value of a class instance field that is being accessed via the dot operator
@@ -337,32 +374,12 @@
 ; Calls the function with the specified name and evaluates it with the specified values for its parameters
 (define call-function
   (lambda (name inputs layers cc throw)
-    (if (pair? name) ; Detects dot operator-based function call (currently the only case where the name is a list)
-      (return-value*
-         (arg1 name)
-         layers  
-         (lambda (instance post-eval-layers)
-           (let* ((class-closure (car (get-variable* (car instance) post-eval-layers)))
-                  (method-layer (cons (new-variable 'this instance)
-                  (class-functions class-closure))))
-           (call-function
-             (arg2 name)
-             inputs
-             (cons method-layer post-eval-layers)
-             (lambda (v post-layers)
-               (if (symbol? (arg1 name)) ; Only write back if instance was a named variable
-                 (set-variable*
-                   (arg1 name)
-                   (get-variable* 'this post-layers)
-                   (propagate-mutations post-eval-layers post-layers)
-                   (lambda (final-layers) (cc v final-layers)))
-                 (cc v (propagate-mutations post-eval-layers post-layers))))
-             throw)))
-         throw)
+    (if (pair? name)
+      (call-dot-function name inputs layers cc throw)
       (if (and (var-exists*? name layers) (is-function? name layers))
-          (let* ((closure (get-variable* name layers))
-                 (func-env ((env-function closure) layers))
-                 (env (cons '() (append func-env layers))))
+        (let* ((closure  (get-variable* name layers))
+               (func-env ((env-function closure) layers))
+               (env      (cons '() (append func-env layers))))
           (compute-params
             (params closure)
             inputs
@@ -370,21 +387,94 @@
             env
             (lambda (env)
               (interpret-raw-code* (func-body closure) (remove-param-placeholders env)
-                (lambda (v s)
-                  (cc v (propagate-mutations layers s)))
-                (lambda (s)
-                  (cc null (propagate-mutations layers s)))
-                (lambda (v s)
-                  (throw v (propagate-mutations layers s)))))
+                (lambda (v s) (cc v (propagate-mutations layers s)))
+                (lambda (s)  (cc null (propagate-mutations layers s)))
+                (lambda (v s) (throw v (propagate-mutations layers s)))))
             throw))
         (error (string-append "The function \"" (symbol->string name) "()\" has not yet been defined!"))))))
+
+; Handles dot operator-based function calls of the form "super.[function]" (i.e. superclass function calls)
+(define call-super-function
+  (lambda (name inputs layers cc throw)
+    (let* ((instance        (get-variable* 'this layers))
+           (runtime-class   (car instance))
+           (current-context (if (var-exists*? '%context layers) (get-variable* '%context layers) runtime-class))
+           (parent-class    (car (car (get-variable* current-context layers))))
+           (method-info     (find-method-in-chain name parent-class layers))
+           (defining-class  (car method-info))
+           (all-field-count (length (get-inherited-fields runtime-class layers)))
+           (def-field-count (length (get-inherited-fields defining-class layers)))
+           (scoped-fields   (list-tail (cadr instance) (- all-field-count def-field-count)))
+           (runtime-methods  (get-all-methods runtime-class layers))
+           (def-methods      (get-all-methods defining-class layers))
+       ; Use runtime methods for virtual dispatch, but ensure 'name' resolves
+       ; to the defining-class version by putting def-methods entry for 'name' first
+           (method-list      (cons (assoc name def-methods)
+                               (filter (lambda (b) (not (eq? (car b) name)))
+                                       runtime-methods)))
+           (method-layer     (append scoped-fields
+                                 (cons (new-variable 'this instance)
+                                 (cons (new-variable '%context defining-class)
+                                       method-list)))))
+      (call-function name inputs (cons method-layer layers) cc throw))))
+
+; Handles dot operator-based function calls of the form "this.[function]" (i.e. class function calls)
+(define call-this-function
+  (lambda (instance-expr name inputs layers cc throw)
+    (return-value* instance-expr layers (lambda (instance post-eval-layers)
+      (let* ((runtime-class   (car instance))
+             (method-info     (find-method-in-chain name runtime-class post-eval-layers))
+             (defining-class  (car method-info))
+             (all-field-count (length (get-inherited-fields runtime-class post-eval-layers)))
+             (def-field-count (length (get-inherited-fields defining-class post-eval-layers)))
+             (field-offset    (- all-field-count def-field-count))
+             (scoped-fields   (list-tail (cadr instance) field-offset))
+             (method-layer    (append scoped-fields
+                                      (cons (new-variable 'this instance)
+                                      (cons (new-variable '%context defining-class)
+                                            (get-all-methods runtime-class post-eval-layers))))))
+        (call-function name inputs (cons method-layer post-eval-layers)
+          (lambda (return-val post-method-layers)
+            ; Write scoped fields back into the instance
+            (let* ((post-method-layer (car post-method-layers))
+                   (updated-fields    (append (take (cadr instance) field-offset)
+                           scoped-fields
+                           (list-tail (cadr instance) all-field-count)))
+                   (updated-instance  (create-instance-closure runtime-class updated-fields)))
+              ; Mutate the instance in place in the layers that existed before the call
+              (if (atom? instance-expr)
+                  (set-variable* instance-expr updated-instance
+                                 (propagate-mutations post-eval-layers post-method-layers)
+                                 (lambda (s) (cc return-val s)))
+                  (cc return-val (propagate-mutations post-eval-layers post-method-layers)))))
+          throw)))
+    throw)))
+
+; Handles function calls that are performed via the dot operator
+(define call-dot-function
+  (lambda (name inputs layers cc throw)
+    (if (eq? (arg1 name) 'super)
+      (call-super-function (arg2 name) inputs layers cc throw)
+      (call-this-function  (arg1 name) (arg2 name) inputs layers cc throw))))
+
+; Returns (DefiningClassName . MethodBinding)
+(define find-method-in-chain
+  (lambda (name classname layers)
+    (let* ((class-closure (car (get-variable* classname layers)))
+           (parent        (car class-closure))
+           (methods       (caddr class-closure)) ; caddr is the list of function bindings
+           (match         (assoc name methods)))
+      (cond
+        (match (cons classname match)) ; Found it!
+        ((null? parent) (error "Method not found:" name))
+        (else (find-method-in-chain name parent layers))))))
 
 ; Removes parameter placeholder bindings created by bind-formal-params
 (define remove-param-placeholders
   (lambda (layers)
     (map (lambda (layer)
            (filter (lambda (binding)
-                     (not (equal? (cdr binding) '(()))))
+                     (not (equal? (value binding) '(()))))
                    layer))
          layers)))
 
@@ -394,17 +484,20 @@
     (if (or (null? caller-layers) (null? post-call-layers))
         caller-layers
         (let* ((caller-depth (length caller-layers))
-               (post-depth (length post-call-layers))
-               (offset (- post-depth caller-depth))
+               (post-depth   (length post-call-layers))
+               (offset       (- post-depth caller-depth))
                (aligned-post (list-tail post-call-layers offset)))
-          (map (lambda (caller-layer post-layer)
-                 (map (lambda (binding)
-                        (if (and (pair? binding) (var-exists? (name binding) post-layer))
-                            (new-variable (name binding) (get-variable (name binding) post-layer))
-                            binding))
-                      caller-layer))
-               caller-layers
-               aligned-post)))))
+          (for-each
+           (lambda (caller-layer post-layer)
+             (for-each
+              (lambda (binding)
+                (when (and (pair? binding) (var-exists? (name binding) post-layer))
+                  (set-box! (cdr binding)
+                            (get-variable (name binding) post-layer))))
+              caller-layer))
+           caller-layers
+           aligned-post)
+          caller-layers))))
 
 (define (atom? x) (and (not (null? x)) (not (pair? x)))) ; Checks if a list item is an atom (i.e. a non-null, non-list object)
 (define (math? statement) (set-member? (set '+ '- '* '/ '%) (car statement))) ; Checks if the statement is just simple arithemetic 
@@ -440,10 +533,6 @@
     ((eq? connective '||) (or arg1 arg2))
     ((eq? connective '!) (not arg1)) ; Logical "not" only needs the first argument, so the second one is ignored if it exists
     (else #f)))
-
-; Takes a name and a value and creates a binding between them
-(define new-variable
-  (lambda (var-name value) (cons var-name value)))
 
 (define (var-exists? var-name variables) (if (assoc var-name variables) #t #f)) ; Checks if a variable with the inputted name exists within a given layer
 (define (var-exists*? var-name layers) (ormap (lambda (k) (var-exists? var-name k)) layers)) ; Checks if a variable with the inputted name exists in general
@@ -481,7 +570,11 @@
       ((var-exists? var-name (car layers)) (error (string-append "The variable \"" (symbol->string var-name) "\" already exists!")))
       (else (next (cons (cons (new-variable var-name value) (car layers)) (cdr layers)))))))
 
-(define (value binding) (cdr binding)) ; Gets the "value" part of a name-value binding
+; Takes a name and a value and creates a binding between them
+(define new-variable
+  (lambda (var-name value) (cons var-name (box value))))
+
+(define (value binding) (unbox (cdr binding))) ; Gets the "value" part of a name-value binding
 (define (name binding) (car binding)) ; Gets the "name" part of a name-value binding
 
 ; Gets the value bound to a variable with the inputted name, if it exists
@@ -507,18 +600,38 @@
   (lambda (var-name val variables return)
     (cond
       ((empty? variables) (error (string-append "The variable \"" (symbol->string var-name) "\" must be declared before it can be assigned a value!")))
-      ((eq? (name (car variables)) var-name) (return (add-variable var-name val (cdr variables))))
+      ((eq? (name (car variables)) var-name)
+       (begin
+         (set-box! (cdr (car variables)) val)
+         (return variables))) ; Return the locally mutated list
       (else (set-variable-cps var-name val (cdr variables) (lambda (k) (return (cons (car variables) k))))))))
-(define set-variable
-  (lambda (var-name val variables) (set-variable-cps var-name val variables values)))
 
 ; New version of set-variable that works with the layers implementation of the program state
 (define set-variable*
   (lambda (var-name val layers next)
     (cond
-      ((empty? layers) (error (string-append "The variable \"" (symbol->string var-name) "\" must be declared before it can be assigned a value!")))
-      ((var-exists? var-name (car layers)) (next (cons (set-variable var-name val (car layers)) (cdr layers))))
-      (else (set-variable* var-name val (cdr layers) (lambda (k) (next (cons (car layers) k))))))))
+      ((empty? layers) 
+       (error (string-append "The variable \"" (symbol->string var-name) "\" must be declared before it can be assigned a value!")))
+      
+      ; Look for the variable in the current top layer
+      ((var-exists? var-name (car layers))
+       (begin
+         ; Use set-box! to mutate the value in place. 
+         ; (cdr (car ...)) gets the box from the binding (name . box)
+         (set-box! (cdr (get-binding var-name (car layers))) val)
+         (next layers)))
+      
+      ; If not in this layer, recurse to the next layer
+      (else 
+       (set-variable* var-name val (cdr layers) 
+                      (lambda (updated-layers) 
+                        (next (cons (car layers) updated-layers))))))))
+
+(define (get-binding var-name layer)
+  (cond
+    ((empty? layer) #f)
+    ((eq? var-name (car (car layer))) (car layer))
+    (else (get-binding var-name (cdr layer)))))
 
 ; Helper to run a single test safely
 (define run-test
