@@ -6,7 +6,7 @@
 ; Interprets the code contained in the file with the inputted filename
 (define interpret*
   (lambda (filename classname)
-    (translate-booleans (call-main (interpret-raw-code* (parser filename) '() value-state values (lambda (v s) (error "Uncaught exception:" v))) classname))))
+    (translate-booleans (call-main (interpret-raw-code* (parser filename) '() null value-state values (lambda (v s) (error "Uncaught exception:" v))) classname))))
 
 ; Assembles the closure for the specified class
 (define create-class-closure
@@ -18,17 +18,20 @@
   (lambda (class instance-field-vals)
     (cons class (list instance-field-vals))))
 
-(define (class-functions class-closure) (arg2 class-closure)) ; Gets the list of functions from a class closure
+(define (class-functions class-closure) (unbox (caddr class-closure))) ; Gets the list of functions from a class closure
 
 ; Extracts bindings of the specified type (i.e. var or function) from the inputted class body
 (define get-class-members-of-type
-  (lambda (type class-body)
+  (lambda (type class-body compile-type layers)
     (filter
       (lambda (k) (eq? (get-type (value k)) type))
-      (car (interpret-raw-code* class-body '() value-state values (lambda (v s) (error "Uncaught exception:" v)))))))
+      (car (interpret-raw-code* class-body layers compile-type values values (lambda (v s) (error "Uncaught exception:" v)))))))
 
-(define (get-class-fields class-body)    (get-class-members-of-type 'var      class-body)) ; Gets the name-value binding of every variable in the inputted class body
-(define (get-class-functions class-body) (get-class-members-of-type 'function class-body)) ; Gets the name-closure binding of every function in the inputted class body
+; Gets the name-value binding of every variable in the inputted class body
+(define (get-class-fields class-body compile-type layers)    (get-class-members-of-type 'var      class-body compile-type layers))
+
+; Gets the name-closure binding of every function in the inputted class body
+(define (get-class-functions class-body compile-type layers) (get-class-members-of-type 'function class-body compile-type layers)) 
 
 ; Replaces "#t" with "true" and "#f" with "false", but leaves the inputted value untouched otherwise
 (define translate-booleans
@@ -39,21 +42,22 @@
 (define call-main
   (lambda (classdefs classname)
     (if (var-exists*? classname classdefs)
-        (let* ((class-contents (list (class-functions (car (get-variable* classname classdefs))))))
+        (let* ((class-contents (list (class-functions (car (get-variable* classname classdefs)))))) ; List wrapping forms 1-layer env with only the class's methods
           (if (var-exists*? 'main class-contents)
-            (call-function 'main '() (append class-contents classdefs) value-state (lambda (v s) (error "Uncaught exception:" v)))
+            (call-function 'main '() (append class-contents classdefs) null value-state (lambda (v s) (error "Uncaught exception:" v)))
             (error "No main() function has been defined in the code for class:" classname)))
         (error (string-append "The class \"" (symbol->string classname) "\" does not exist!")))))
 
 ; Interprets the inputted pre-parsed code one statement at a time, or returns the value of the current statement if it is a "return" statement 
 (define interpret-raw-code*
-  (lambda (code layers return fallthrough throw)
+  (lambda (code layers compile-type return fallthrough throw)
     (cond
       ((null? code) (fallthrough layers))
       (else (interpret-statement*
         (car code)
         layers
-        (lambda (v) (interpret-raw-code* (cdr code) v return fallthrough throw))
+        compile-type
+        (lambda (v) (interpret-raw-code* (cdr code) v compile-type return fallthrough throw))
         return
         (lambda (layers) (error "Continue statements must be inside of a loop!"))
         (lambda (layers) (error "Break statements must be inside of a loop!"))
@@ -99,36 +103,10 @@
 ; Returns an anonymous function that constructs a function's environment
 (define construct-environment
   (lambda (formal-params body outer-state)
-    (let* ((body-atoms (flatten body))
-           (written-vars (get-assigned-vars body))
-           (param-layer (bind-formal-params formal-params))
-           (func-layer (foldl (lambda (k acc)
-           (if (and (atom? k)
-                                         (not (member k formal-params))
-                                         (not (var-exists? k acc))
-                                         (var-exists*? k outer-state)
-                                         (not (null? (get-variable* k outer-state)))
-                                         (and (member k body-atoms)
-                                              (not (member k written-vars))
-                                              (not (is-function? k outer-state))))
-                                    (cons (new-variable k (get-variable* k outer-state)) acc)
-                                    acc))
-                              '()
-                              (append body-atoms (flatten outer-state)))))
-      (lambda (call-time-state) (append (list param-layer func-layer) call-time-state)))))
+    (let ((param-layer (bind-formal-params formal-params)))
+      (lambda (call-time-state) (cons param-layer call-time-state)))))
 
-; Helper function for getting only assigned variables from the function body
-(define get-assigned-vars
-  (lambda (body)
-    (foldl (lambda (stmt acc)
-             (cond
-               ((and (pair? stmt) (assignment? stmt)) (cons (arg1 stmt) acc))
-               ((pair? stmt) (append (get-assigned-vars stmt) acc))
-               (else acc)))
-           '()
-           body)))
-
-; Helper function that allows for statements of the form "this.[field name]" to be assigned a value
+; Helper function that allows for statements of the form "this.[field name]" to be assigned a value (left operand must be a plain variable name)
 (define dot-assign
   (lambda (dot-expr new-val layers next)
     (let* ((instance-name (arg1 dot-expr))
@@ -141,42 +119,47 @@
 
 ; Updates the program's variable layers by executing the inputted statement, or returning its associated value if it is a "return" statement
 (define interpret-statement*
-  (lambda (statement layers next return continue break throw)
+  (lambda (statement layers compile-type next return continue break throw)
     (cond
       ((null? statement) (next layers))
-      ((class-def? statement) (add-variable*
-        (arg1 statement)
-        (list (create-class-closure
-               (if (empty? (arg2 statement)) null (arg1 (arg2 statement)))
-               (get-class-fields (arg3 statement))
-               (get-class-functions (arg3 statement))))
-        layers
-        next))
-      ((block? statement) (execute-block (cdr statement) (new-layer layers) next return continue break throw))
-      ((try? statement) (try-catch-block (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
-      ((throw? statement) (return-value* (cdr statement) layers (lambda (k s) (throw k s)) throw))
+      ((class-def? statement)
+       (let* ((classname  (arg1 statement))
+              (superclass (if (empty? (arg2 statement)) null (arg1 (arg2 statement))))
+              (fields     (get-class-fields (arg3 statement) classname layers))
+              (methods-box (box '()))) 
+         (add-variable* classname
+                        (list (create-class-closure superclass fields methods-box))
+                        layers
+                        (lambda (layers-with-class)
+                          (let ((functions (get-class-functions (arg3 statement) classname layers-with-class)))
+                            (set-box! methods-box functions) 
+                            (next layers-with-class))))))
+      ((block? statement) (execute-block (cdr statement) (new-layer layers) compile-type next return continue break throw))
+      ((try? statement) (try-catch-block (arg1 statement) (arg2 statement) (arg3 statement) layers compile-type next return continue break throw))
+      ((throw? statement) (return-value* (cdr statement) layers compile-type (lambda (k s) (throw k s)) throw))
       ((continue? statement) (continue layers))
       ((break? statement) (break layers))
-      ((function-call? statement) (call-function (arg1 statement) (cdr (cdr statement)) layers (lambda (v s) (next s)) throw))
-      ((declaration? statement) (return-value* (arg2 statement) layers (lambda (k s) (add-variable* (arg1 statement) k s next)) throw))
+      ((function-call? statement) (call-function (arg1 statement) (cdr (cdr statement)) layers compile-type (lambda (v s) (next s)) throw))
+      ((declaration? statement) (return-value* (arg2 statement) layers compile-type (lambda (k s) (add-variable* (arg1 statement) k s next)) throw))
       ((assignment? statement) (return-value*
         (arg2 statement)
         layers
+        compile-type
         (lambda (k s) (if (pair? (arg1 statement))
           (dot-assign (arg1 statement) k s next)
           (set-variable* (arg1 statement) k s next)))
         throw))
-      ((if-statement? statement) (if-statement* (arg1 statement) (arg2 statement) (arg3 statement) layers next return continue break throw))
-      ((while-statement? statement) (while-statement* (arg1 statement) (arg2 statement) layers next return continue break throw))
-      ((return? statement) (return-value* (cdr statement) layers (lambda (k s) (return k s)) throw))
+      ((if-statement? statement) (if-statement* (arg1 statement) (arg2 statement) (arg3 statement) layers compile-type next return continue break throw))
+      ((while-statement? statement) (while-statement* (arg1 statement) (arg2 statement) layers compile-type next return continue break throw))
+      ((return? statement) (return-value* (cdr statement) layers compile-type (lambda (k s) (return k s)) throw))
       ((function-def? statement) (add-variable*
         (arg1 statement)
-        (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement) layers))
+        (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement) layers) compile-type)
         layers
         next))
       ((static-f-def? statement) (add-variable*
         (arg1 statement)
-        (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement) layers))
+        (create-closure (arg2 statement) (arg3 statement) (construct-environment (arg2 statement) (arg3 statement) layers) compile-type)
         layers
         next))
       (else (error "The following statement could not be parsed: " statement)))))
@@ -210,13 +193,14 @@
 
 ; Handles execution of code blocks, automatically removing the block's variable layer once execution is finished
 (define execute-block
-  (lambda (code layers next return continue break throw)
+  (lambda (code layers compile-type next return continue break throw)
     (cond
       ((null? code) (next (cdr layers)))
       (else (interpret-statement*
         (car code)
         layers
-        (lambda (v) (execute-block (cdr code) v next return continue break throw))
+        compile-type
+        (lambda (v) (execute-block (cdr code) v compile-type next return continue break throw))
         return
         continue
         (lambda (v) (break (cdr v)))
@@ -224,63 +208,68 @@
 
 ; Handles execution of try-catch blocks
 (define try-catch-block
-  (lambda (try catch finally layers next return continue break throw)
+  (lambda (try catch finally layers compile-type next return continue break throw)
     (execute-block
       try
       (new-layer layers)
-      (lambda (k) (run-finally finally k next return continue break throw))
+      compile-type
+      (lambda (k) (run-finally finally k compile-type next return continue break throw))
       return
       continue
-      (lambda (brk-s) (run-finally finally brk-s (lambda (fs) (break fs)) return continue break throw))
+      (lambda (brk-s) (run-finally finally brk-s compile-type (lambda (fs) (break fs)) return continue break throw))
       (if (null? catch)
         throw
-        (catch-throw catch finally layers next return continue break throw)))))
+        (catch-throw catch finally layers compile-type next return continue break throw)))))
 
 ; Helper function for executing the "finally" portion of the try-catch block, if it exists
 (define run-finally
-  (lambda (finally layers next return continue break throw)
+  (lambda (finally layers compile-type next return continue break throw)
     (if (null? finally)
         (next layers)
-        (execute-block (arg1 finally) (new-layer layers) next return continue break throw))))
+        (execute-block (arg1 finally) (new-layer layers) compile-type next return continue break throw))))
 
 ; Helper function that output the value-state continuation function that executes the "catch" portion of the try-catch block, if it exists
 (define catch-throw
-  (lambda (catch finally layers next return continue break throw)
+  (lambda (catch finally layers compile-type next return continue break throw)
     (lambda (v s)
       (add-variable* (car (arg1 catch)) v (new-layer (cdr s))
         (lambda (catch-env) (execute-block
           (arg2 catch)
           catch-env
-          (lambda (k) (run-finally finally k next return continue break throw))
-          (lambda (ret-val ret-s) (run-finally finally ret-s (lambda (fs) (return ret-val fs)) return continue break throw))
+          compile-type               
+          (lambda (k) (run-finally finally k compile-type next return continue break throw))
+          (lambda (ret-val ret-s) (run-finally finally ret-s compile-type (lambda (fs) (return ret-val fs)) return continue break throw))
           continue
           break
-          (lambda (thr-val thr-s) (run-finally finally thr-s (lambda (fs) (throw thr-val fs)) return continue break throw))))))))
+          (lambda (thr-val thr-s) (run-finally finally thr-s compile-type (lambda (fs) (throw thr-val fs)) return continue break throw))))))))
 
 ; Executes the inputted "if" statement and updates the program's variable layers accordingly
 (define if-statement*
-  (lambda (condition if-true else layers next return continue break throw)
+  (lambda (condition if-true else layers compile-type next return continue break throw)
     (return-value*
       condition
       layers
+      compile-type
       (lambda (condition-result side-effect) (if condition-result
-        (interpret-statement* if-true side-effect next return continue break throw)
-        (interpret-statement* else side-effect next return continue break throw)))
+        (interpret-statement* if-true side-effect compile-type next return continue break throw)
+        (interpret-statement* else side-effect compile-type next return continue break throw)))
       throw)))
 
 ; Executes the inputted "while" statement and updates the program's variable layers accordingly
 (define while-statement*
-  (lambda (condition body layers next return continue break throw)
+  (lambda (condition body layers compile-type next return continue break throw)
     (return-value*
       condition
       layers
+      compile-type
       (lambda (condition-result side-effect) (if condition-result
         (interpret-statement*
           body
           side-effect
-          (lambda (new-layers) (while-statement* condition body new-layers next return continue break throw))
+          compile-type
+          (lambda (new-layers) (while-statement* condition body new-layers compile-type next return continue break throw))
           return
-          (lambda (new-layers) (while-statement* condition body new-layers next return continue break throw))
+          (lambda (new-layers) (while-statement* condition body new-layers compile-type next return continue break throw))
           next
           throw)
         (next side-effect)))
@@ -288,7 +277,7 @@
 
 ; Interprets simple statements (i.e. expressions) and returns their results
 (define return-value*
-  (lambda (output layers cc throw)
+  (lambda (output layers compile-type cc throw)
     (cond
       ((null? output) (cc null layers))
       ((number? output) (cc output layers))
@@ -299,29 +288,33 @@
       ((math? output) (return-value*
           (arg1 output)
           layers
-          (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (do-math (car output) k1 k2) s2)) throw))
+          compile-type
+          (lambda (k1 s1) (return-value* (arg2 output) s1 compile-type (lambda (k2 s2) (cc (do-math (car output) k1 k2) s2)) throw))
           throw))
       ((comparison? output) (return-value*
           (arg1 output)
           layers
-          (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (compare (car output) k1 k2) s2)) throw))
+          compile-type
+          (lambda (k1 s1) (return-value* (arg2 output) s1 compile-type (lambda (k2 s2) (cc (compare (car output) k1 k2) s2)) throw))
           throw))
       ((boolean-expression? output) (return-value*
           (arg1 output)
           layers
-          (lambda (k1 s1) (return-value* (arg2 output) s1 (lambda (k2 s2) (cc (boolean (car output) k1 k2) s2)) throw))
+          compile-type
+          (lambda (k1 s1) (return-value* (arg2 output) s1 compile-type (lambda (k2 s2) (cc (boolean (car output) k1 k2) s2)) throw))
           throw))
       ((assignment? output) (return-value*
           (arg2 output)
           layers
+          compile-type
           (lambda (k s) (if (pair? (arg1 output))
             (dot-assign (arg1 output) k s (lambda (updated-layers) (cc k updated-layers)))
             (set-variable* (arg1 output) k s (lambda (updated-layers) (cc k updated-layers)))))
           throw))
-      ((function-call? output) (call-function (arg1 output) (cdr (cdr output)) layers (lambda (v s) (cc v s)) throw))
+      ((function-call? output) (call-function (arg1 output) (cdr (cdr output)) layers compile-type (lambda (v s) (cc v s)) throw))
       ((new? output) (instantiate-class (arg1 output) layers cc throw))
-      ((dot-operator? output) (access-class-field (arg1 output) (arg2 output) layers cc throw))
-      (else (return-value* (car output) layers cc throw)))))
+      ((dot-operator? output) (access-class-field (arg1 output) (arg2 output) layers compile-type cc throw))
+      (else (return-value* (car output) layers compile-type cc throw)))))
 
 ; Creates a new instance of the specified class and returns an error if the class does not exist
 (define instantiate-class
@@ -333,23 +326,41 @@
 
 ; Gets the value of a class instance field that is being accessed via the dot operator
 (define access-class-field
-  (lambda (instance-expression fieldname layers cc throw)
-    (return-value*
-      instance-expression
-      layers
-      (lambda (instance post-eval-layers)
-        (let* ((field-vals (cadr instance)))
-            (if (var-exists*? fieldname (list field-vals))
-              (cc (get-variable fieldname field-vals) post-eval-layers)
-              (error (string-append
-                      "The field \"" (symbol->string fieldname)
-                      "\" does not exist in the instance \"" (symbol->string instance-expression)
-                      "\" of class " (symbol->string (get-type (get-variable* instance-expression layers))) "!")))))
-      throw)))
+  (lambda (instance-expression fieldname layers compile-type cc throw)
+    (if (eq? instance-expression 'super)
+        (let* ((class-closure   (car (get-variable* compile-type layers)))
+               (parent-class    (car class-closure)))
+          (if (null? parent-class)
+              (error (string-append "Cannot access super: \""
+                                    (symbol->string compile-type)
+                                    "\" has no superclass"))
+              (let* ((instance        (get-variable* 'this layers))
+                     (runtime-class   (car instance))
+                     (all-field-count (length (get-inherited-fields runtime-class layers)))
+                     (def-field-count (length (get-inherited-fields parent-class layers)))
+                     (scoped-fields   (list-tail (cadr instance) (- all-field-count def-field-count))))
+                (if (var-exists*? fieldname (list scoped-fields))
+                    (cc (get-variable fieldname scoped-fields) layers)
+                    (error (string-append "The field \"" (symbol->string fieldname)
+                                         "\" does not exist in superclass \""
+                                         (symbol->string parent-class) "\"!"))))))
+        (return-value*
+          instance-expression
+          layers
+          compile-type
+          (lambda (instance post-eval-layers)
+            (let ((field-vals (cadr instance)))
+              (if (var-exists*? fieldname (list field-vals))
+                  (cc (get-variable fieldname field-vals) post-eval-layers)
+                  (error (string-append
+                          "The field \"" (symbol->string fieldname)
+                          "\" does not exist in instance of class \""
+                          (symbol->string (car instance)) "\"!")))))
+          throw))))
 
 ; Computes the values of the parameters inputted into a function call and binds them to the formal parameters in the function environment
 (define compute-params
-  (lambda (params inputs layers environment cc throw)
+  (lambda (params inputs layers compile-type environment cc throw)
     (cond
       ((and (null? params) (null? inputs)) (cc environment))
       ((or (null? params) (null? inputs))
@@ -358,29 +369,35 @@
         (return-value*
           (car inputs)
           layers
+          compile-type                   
           (lambda (v s) (set-variable*
             (car params)
             v
             environment
-            (lambda (updated-env) (compute-params (cdr params) (cdr inputs) layers updated-env cc throw))))
+            (lambda (updated-env) (compute-params (cdr params) (cdr inputs) layers compile-type updated-env cc throw))))
           throw)))))
 
 ; Calls the function with the specified name and evaluates it with the specified values for its parameters
 (define call-function
-  (lambda (name inputs layers cc throw)
+  (lambda (name inputs layers compile-type cc throw)
     (if (pair? name)
-      (call-dot-function name inputs layers cc throw)
+      (call-dot-function name inputs layers compile-type cc throw)
       (if (and (var-exists*? name layers) (is-function? name layers))
-        (let* ((closure  (get-variable* name layers))
-               (func-env ((env-function closure) layers))
-               (env      (cons '() func-env)))
+        (let* ((closure          (get-variable* name layers))
+               (method-compile-type (closure-compile-type closure)) 
+               (func-env         ((env-function closure) layers))
+               (env (if (var-exists*? 'this layers)
+                        (cons (list (new-variable 'this (get-variable* 'this layers))) func-env)
+                        (cons '() func-env))))
           (compute-params
             (params closure)
             inputs
             layers
+            compile-type                
             env
             (lambda (env)
               (interpret-raw-code* (func-body closure) (remove-param-placeholders env)
+                method-compile-type    
                 (lambda (v s) (cc v (propagate-mutations layers s)))
                 (lambda (s)  (cc null (propagate-mutations layers s)))
                 (lambda (v s) (throw v (propagate-mutations layers s)))))
@@ -389,42 +406,44 @@
 
 ; Handles dot operator-based function calls of the form "super.[function]" (i.e. superclass function calls)
 (define call-super-function
-  (lambda (name inputs layers cc throw)
-    (let* ((instance        (get-variable* 'this layers))
-           (runtime-class   (car instance))
-           (current-context (if (var-exists*? '%context layers) (get-variable* '%context layers) runtime-class))
-           (parent-class    (car (car (get-variable* current-context layers))))
-           (method-info     (find-method-in-chain name parent-class layers))
-           (defining-class  (car method-info))
-           (all-field-count (length (get-inherited-fields runtime-class layers)))
-           (def-field-count (length (get-inherited-fields defining-class layers)))
-           (scoped-fields   (list-tail (cadr instance) (- all-field-count def-field-count)))
-           (runtime-methods  (get-all-methods runtime-class layers))
-           (def-methods      (get-all-methods defining-class layers))
-           (method-list      (cons (assoc name def-methods)
-                               (filter (lambda (b) (not (eq? (car b) name)))
-                                       runtime-methods)))
-           (method-layer     (append scoped-fields
-                                 (cons (new-variable 'this instance)
-                                 (cons (new-variable '%context defining-class)
-                                       method-list)))))
-      (call-function name inputs (cons method-layer layers) cc throw))))
+  (lambda (name inputs layers compile-type cc throw)
+    (let* ((parent-class (car (car (get-variable* compile-type layers)))))
+      (if (null? parent-class)
+          (error (string-append "Cannot call super: \"" (symbol->string compile-type) "\" has no superclass"))
+          (let* ((instance        (get-variable* 'this layers))
+                 (runtime-class   (car instance))
+                 (method-info     (find-method-in-chain name parent-class layers))
+                 (defining-class  (car method-info))
+                 (closure         (value (cdr method-info)))
+                 (method-compile-type (closure-compile-type closure))
+                 (all-field-count (length (get-inherited-fields runtime-class layers)))
+                 (def-field-count (length (get-inherited-fields defining-class layers)))
+                 (scoped-fields   (list-tail (cadr instance) (- all-field-count def-field-count)))
+                 (runtime-methods (get-all-methods runtime-class layers))
+                 (def-methods     (get-all-methods defining-class layers))
+                 (method-list     (cons (assoc name def-methods)
+                                    (filter (lambda (b) (not (eq? (car b) name)))
+                                            runtime-methods)))
+                 (method-layer    (append scoped-fields
+                                    (cons (new-variable 'this instance)
+                                          method-list))))
+            (call-function name inputs (cons method-layer layers) method-compile-type cc throw))))))
 
 ; Handles function calls of the form "this.[function]" (i.e. class function calls)
 (define call-this-function
-  (lambda (instance-expr name inputs layers cc throw)
-    (return-value* instance-expr layers (lambda (instance post-eval-layers)
+  (lambda (instance-expr name inputs layers compile-type cc throw)
+    (return-value* instance-expr layers compile-type (lambda (instance post-eval-layers)
       (let* ((runtime-class   (car instance))
              (method-info     (find-method-in-chain name runtime-class post-eval-layers))
              (defining-class  (car method-info))
              (closure         (value (cdr method-info)))
+             (method-compile-type (closure-compile-type closure)) 
              (all-field-count (length (get-inherited-fields runtime-class post-eval-layers)))
              (def-field-count (length (get-inherited-fields defining-class post-eval-layers)))
              (field-offset    (- all-field-count def-field-count))
              (scoped-fields   (list-tail (cadr instance) field-offset))
              (method-layer    (cons (new-variable 'this instance)
-                               (cons (new-variable '%context defining-class)
-                                     (get-all-methods runtime-class post-eval-layers))))
+                                    (get-all-methods runtime-class post-eval-layers)))
              (call-env        (cons (bind-formal-params (params closure))
                                (cons scoped-fields
                                  (cons method-layer post-eval-layers)))))
@@ -432,11 +451,13 @@
           (params closure)
           inputs
           post-eval-layers
+          compile-type
           call-env
           (lambda (env)
             (interpret-raw-code*
               (func-body closure)
               (remove-param-placeholders env)
+              method-compile-type    
               (lambda (return-val post-method-layers) (update-instance-and-return
                   return-val
                   post-method-layers
@@ -453,6 +474,13 @@
                 (update-instance-and-throw v s instance instance-expr scoped-fields runtime-class post-eval-layers throw))))
           throw)))
     throw)))
+
+; Handles function calls that are performed via the dot operator
+(define call-dot-function
+  (lambda (name inputs layers compile-type cc throw)
+    (if (eq? (arg1 name) 'super)
+      (call-super-function (arg2 name) inputs layers compile-type cc throw)
+      (call-this-function  (arg1 name) (arg2 name) inputs layers compile-type cc throw))))
 
 ; Helper function that ensures the proper updating of instance fields when a method returns normally
 (define update-instance-and-return
@@ -487,27 +515,16 @@
         (else
          (throw v propagated))))))
 
-; Handles function calls that are performed via the dot operator
-(define call-dot-function
-  (lambda (name inputs layers cc throw)
-    (if (eq? (arg1 name) 'super)
-      (call-super-function (arg2 name) inputs layers cc throw)
-      (call-this-function  (arg1 name) (arg2 name) inputs layers cc throw))))
-
 ; Returns (DefiningClassName . MethodBinding)
 (define find-method-in-chain
   (lambda (name classname layers)
     (let* ((class-closure (car (get-variable* classname layers)))
            (parent        (car class-closure))
-           (methods       (caddr class-closure)) 
+           (methods       (class-functions class-closure)) 
            (match         (assoc name methods)))
       (cond
-        (match (cons classname match)) 
-        ((null? parent)
-         (let ((fallback (assoc name (get-all-methods (car (get-variable* 'this layers)) layers))))
-           (if fallback
-               (cons (car (get-variable* 'this layers)) fallback)
-               (error "Method not found:" name))))
+        (match (cons classname match))
+        ((null? parent) (error "Method not found:" name))
         (else (find-method-in-chain name parent layers))))))
 
 ; Removes parameter placeholder bindings created by bind-formal-params
@@ -582,18 +599,19 @@
 ; Gets the type of the variable associated with the inputted value based on the value's structure
 (define (get-type var-value)
   (match var-value
-    [(list _ _ _) 'function]
+    [(list _ _ _ _) 'function]
     [(list class _) class]
     [_ 'var]))
 
-; Creates a 3-tuple of a function's formal parameters, body, and environment function to represent its closure
+; Creates a 4-tuple of a function's formal parameters, body, environment function, and compile-time type to represent its closure
 (define create-closure
-  (lambda (formal-params body env-func)
-    (list formal-params body env-func)))
+  (lambda (formal-params body env-func compile-type)
+    (list formal-params body env-func compile-type)))
 
 (define (params closure) (car closure)) ; Gets the formal parameters from a function's closure
 (define (func-body closure) (cadr closure)) ; Gets the function body from a function's closure
 (define (env-function closure) (caddr closure)) ; Gets the environment function from a function's closure
+(define (closure-compile-type closure) (cadddr closure)) ; Gets the compile-time type from a function's closure
 
 ; Adds a new variable with the inputted name and value if it doesn't already exist
 (define add-variable
@@ -661,6 +679,7 @@
                       (lambda (updated-layers) 
                         (next (cons (car layers) updated-layers))))))))
 
+; Returns the full binding pair for a variable in a single layer, or #f if it cannot be found
 (define (get-binding var-name layer)
   (cond
     ((empty? layer) #f)
